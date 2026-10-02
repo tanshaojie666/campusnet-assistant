@@ -1,0 +1,111 @@
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller / packaging output
+*.manifest
+*.spec.bak
+build/*/
+dist/*/
+
+# Unit test / coverage
+.pytest_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+.python-version
+
+# ---------------------------------------------------------------------------
+# IDE / editor
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+.project
+.pydevproject
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+dmypy.json
+
+# ---------------------------------------------------------------------------
+# OS junk
+# ---------------------------------------------------------------------------
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# 本项目的隐私 / 本地文件 —— 绝对不要提交
+# ---------------------------------------------------------------------------
+# 用户配置与系统级配置：含拨号账号、加密密码、客户端路径、节点信息
+config.json
+**/config.json
+campusnet.config.json
+
+# 运行日志与安装日志
+*.log
+*.txt.log
+运行日志.txt
+开机拨号日志.txt
+安装日志.txt
+heartbeat.txt
+task.xml
+
+# 运行期状态标记
+stop.flag
+pause.until
+
+# Windows 凭据 / 导出文件（DPAPI 密文、凭据导出）
+credential*.xml
+*credential*.xml
+*.cred
+*.key
+
+# 截图里容易带上个人信息，个人截图别提交（docs/images 下的正式截图除外）
+/screenshots/
+/local/
+*.local.json
