@@ -68,7 +68,7 @@ def boot_mode():
     password = cfg.get("password_machine") or ""
     from .util import dpapi_decrypt
     password = dpapi_decrypt(password, machine=True)
-    interval = max(5, int(cfg.get("interval") or 15))
+    interval = max(5, int(cfg.get("interval") or 10))
     if not cfg.get("mode"):
         boot_log("提示：系统级配置仍是旧版格式（只有 connection/username），"
                  "接入方式按“有线拨号”处理；重新运行 --install-boot 可写入新格式。")
@@ -113,6 +113,9 @@ def boot_mode():
         vpn_switch_delay = 10
     vpn_last_on = 0.0               # 最近一次"检测到在用代理"的时间
     vpn_restored = False            # 这一轮翻墙结束后是否已经把校园网切回来了
+    auto_dial = bool(guard_cfg.get("auto_dial", True))
+    kill_before_dial = bool(guard_cfg.get("kill_before_dial", True))
+    last_nodial_log = 0.0           # "自动连校园网已关闭"这条日志的节流
     link_started = 0.0            # 校园网链路是什么时候连上的（用于 KILL_WINDOW 判断）
     flip_logged = False           # 「翻墙模式在用代理」这条日志只记一次，避免刷屏
     mtime = _script_mtime()
@@ -174,6 +177,9 @@ def boot_mode():
             reconnect_no_flip = bool(rules.get("reconnect_when_no_flip",
                                                guard_rules.get("reconnect_when_no_flip")))
             follow_vpn = bool(rules.get("follow_vpn", guard_rules.get("follow_vpn")))
+            auto_dial = bool(rules.get("auto_dial", guard_rules.get("auto_dial", True)))
+            kill_before_dial = bool(rules.get("kill_before_dial",
+                                              guard_rules.get("kill_before_dial", True)))
             vpn_hotspot_ssid = str(rules.get("vpn_hotspot_ssid")
                                    or guard_rules.get("vpn_hotspot_ssid") or "")
             procs_snapshot = list_processes() or {}
@@ -440,9 +446,12 @@ def boot_mode():
                 continue
 
             # 两次拨号之间至少隔 MIN_DIAL_GAP 秒：
-            # 否则"拨号返回成功但探测不到网络"这种情况会让它每 15 秒猛拨一次，
-            # 既刷日志也可能触发学校的风控。
-            if time.time() - last_dial_ts < MIN_DIAL_GAP:
+            # 否则"拨号返回成功但探测不到网络"这种情况会让它每 10 秒猛拨一次，
+            # 既刷日志也可能撞上学校的并发限制。
+            #
+            # **例外**：链路本身是断的（PPPoE 没连上）时不等 —— 这正是
+            # "没连 VPN 时保证不断网"最需要快速恢复的场景，等 60 秒就太久了。
+            if ppp_up and (time.time() - last_dial_ts < MIN_DIAL_GAP):
                 sleep_interruptible(interval, lambda: os.path.isfile(BOOT_STOP))
                 continue
             last_dial_ts = time.time()
@@ -451,6 +460,13 @@ def boot_mode():
             # 用户手动切走时（wifi / none），**不要**再自作主张连校园网 ——
             # 否则"全部断开"之后一没网就会被他自动拨回来。
             manual_off = get_network_choice(cfg) in ("wifi", "none")
+            # 「自动连校园网」总开关：关掉后只监视、不拨号（想完全手动时用）
+            if not auto_dial:
+                if time.time() - last_nodial_log > 600:
+                    last_nodial_log = time.time()
+                    boot_log("检测到掉线，但「自动连校园网」开关是关的 → 不拨号。")
+                sleep_interruptible(interval, lambda: os.path.isfile(BOOT_STOP))
+                continue
 
             if not manual_off and (mode == "wireless"
                                    or (mode == "both" and not ppp_up and wifi_ssid)):
@@ -465,7 +481,7 @@ def boot_mode():
                 boot_log("检测到校园网没连上，准备拨号…")
                 # 先干掉代理/VPN：它们会抢路由、拦 DNS，导致拨号慢甚至拨不上。
                 # 杀完只等 2 秒（原来是 3 秒）就继续，尽量快。
-                if kill_on:
+                if kill_on and kill_before_dial:
                     t_kill = time.time()
                     acted, detail = kill_processes(processes)
                     if acted:

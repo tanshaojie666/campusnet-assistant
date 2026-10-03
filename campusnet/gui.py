@@ -270,6 +270,9 @@ class App:
                        "你就不用管了。\n判定「没在用代理」看的是翻墙标记 + 上面的关闭名单里的进程。"
                   ).pack(anchor="w", pady=(2, 0))
 
+        # ---- 功能开关：所有自动行为都能在这里关掉 ----
+        self._build_switches(f)
+
         wp = ttk.LabelFrame(f, text=" 无线策略 ", padding=12)
         wp.pack(fill="x", pady=(12, 0))
         self.wifi_policy_var = tk.StringVar(value=self.cfg["guard"].get("wifi_policy", "off"))
@@ -982,6 +985,42 @@ class App:
         self.log("正在检查更新…")
         threading.Thread(target=work, daemon=True).start()
 
+    def _build_switches(self, parent):
+        """「功能开关」：每个自动行为都能单独关掉。"""
+        sw = ttk.LabelFrame(parent, text=" 功能开关 ", padding=12)
+        sw.pack(fill="x", pady=(10, 0))
+        g = self.cfg.get("guard") or {}
+        ap = self.cfg.get("app") or {}
+
+        self.auto_dial_var = tk.BooleanVar(value=bool(g.get("auto_dial", True)))
+        ttk.Checkbutton(sw, variable=self.auto_dial_var,
+                        text="断线自动重拨（自动连校园网）—— 关掉后只监视、不拨号"
+                        ).pack(anchor="w")
+        self.kill_before_var = tk.BooleanVar(value=bool(g.get("kill_before_dial", True)))
+        ttk.Checkbutton(sw, variable=self.kill_before_var,
+                        text="拨号 / 接入前先关闭代理和 VPN（它们会抢路由、拦 DNS）"
+                        ).pack(anchor="w")
+        self.auto_update_var = tk.BooleanVar(value=bool(ap.get("auto_update", True)))
+        ttk.Checkbutton(sw, variable=self.auto_update_var,
+                        text="程序文件更新后自动重启生效").pack(anchor="w")
+        self.tray_var = tk.BooleanVar(value=bool(ap.get("tray", True)))
+        ttk.Checkbutton(sw, variable=self.tray_var,
+                        text="点关闭只是收进托盘，程序继续在后台跑（不勾 = 点关闭就退出）"
+                        ).pack(anchor="w")
+        self.single_var = tk.BooleanVar(value=bool(ap.get("single_instance", True)))
+        ttk.Checkbutton(sw, variable=self.single_var,
+                        text="同一时间只允许开一个程序").pack(anchor="w")
+
+        irow = ttk.Frame(sw)
+        irow.pack(fill="x", pady=(6, 0))
+        ttk.Label(irow, text="检测间隔（秒）：").pack(side="left")
+        self.interval_var = tk.StringVar(
+            value=str(self.cfg.get("campus", {}).get("interval") or 10))
+        ttk.Combobox(irow, textvariable=self.interval_var, width=5, font=self.font,
+                     values=["5", "10", "15", "20", "30"]).pack(side="left", padx=4)
+        ttk.Label(irow, text="越小越灵敏 —— 没连 VPN 时断线能更快恢复",
+                  foreground="#5f6368").pack(side="left")
+
     def switch_network(self):
         """手动切换网络：校园网 / 某个无线 / 全部断开。
 
@@ -1098,8 +1137,11 @@ class App:
             pass
 
     def _check_self_update(self):
-        """每 15 秒看一眼程序文件有没有被更新过。"""
+        """每 15 秒看一眼程序文件有没有被更新过（可在「功能开关」里关掉）。"""
         if self.closing:
+            return
+        if not (self.cfg.get("app") or {}).get("auto_update", True):
+            self.root.after(15000, self._check_self_update)
             return
         try:
             if self._code_mtime() > self.code_mtime:
@@ -1169,6 +1211,16 @@ class App:
         cfg["guard"]["reconnect_when_no_flip"] = bool(self.reconnect_var.get())
         cfg["guard"]["follow_vpn"] = bool(self.follow_vpn_var.get())
         cfg["guard"]["vpn_hotspot_ssid"] = self.vpn_ssid_var.get().strip()
+        cfg["guard"]["auto_dial"] = bool(self.auto_dial_var.get())
+        cfg["guard"]["kill_before_dial"] = bool(self.kill_before_var.get())
+        cfg.setdefault("app", {})
+        cfg["app"]["auto_update"] = bool(self.auto_update_var.get())
+        cfg["app"]["tray"] = bool(self.tray_var.get())
+        cfg["app"]["single_instance"] = bool(self.single_var.get())
+        try:
+            cfg["campus"]["interval"] = max(5, int(self.interval_var.get()))
+        except (TypeError, ValueError):
+            cfg["campus"]["interval"] = 10
         cfg["flip"]["enabled"] = bool(self.flip_var.get())
         cfg["flip"]["when"] = self.flip_when_var.get() or "off_campus"
         cfg["flip"]["browser_always"] = bool(self.browser_always_var.get())
@@ -1184,6 +1236,8 @@ class App:
         rules["reconnect_when_no_flip"] = cfg["guard"]["reconnect_when_no_flip"]
         rules["follow_vpn"] = cfg["guard"]["follow_vpn"]
         rules["vpn_hotspot_ssid"] = cfg["guard"]["vpn_hotspot_ssid"]
+        rules["auto_dial"] = cfg["guard"]["auto_dial"]
+        rules["kill_before_dial"] = cfg["guard"]["kill_before_dial"]
         rules["flip"] = cfg["flip"]
         save_rules(rules)
         if cfg["campus"]["account"] and self.pwd_var.get():
@@ -1518,6 +1572,10 @@ class App:
             pass
 
     def on_close(self):
+        # 「点关闭只是收进托盘」可以在「功能开关」里关掉；关掉后点 × 就是真退出。
+        if not (self.cfg.get("app") or {}).get("tray", True):
+            self.quit_app()
+            return
         try:
             self.root.withdraw()
         except Exception:
@@ -1557,11 +1615,14 @@ def run_gui(minimized=False, cfg=None):
     import ctypes
     from .util import named_mutex
     handle = None
-    for _ in range(8):
-        handle = named_mutex("Global\\CampusNetAssistant.Gui")
-        if handle is not None:
-            break
-        time.sleep(1)
+    if (cfg.get("app") or {}).get("single_instance", True):
+        for _ in range(8):
+            handle = named_mutex("Global\\CampusNetAssistant.Gui")
+            if handle is not None:
+                break
+            time.sleep(1)
+    else:
+        handle = True          # 用户关掉了"只允许一个"，就不再抢锁
     if handle is None:
         try:
             ctypes.windll.user32.MessageBoxW(

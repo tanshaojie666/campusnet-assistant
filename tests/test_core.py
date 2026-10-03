@@ -345,6 +345,27 @@ class TestRuntimeSignals(unittest.TestCase):
                       "follow_vpn": False, "vpn_hotspot_ssid": "", "flip": {}})
         self.assertFalse(C.load_rules(None)["follow_vpn"])
 
+    def test_feature_switches_default_on(self):
+        """所有自动行为默认开着，但都必须能关（「功能开关」区）。"""
+        app = DEFAULT_CONFIG["app"]
+        self.assertTrue(app["auto_update"])
+        self.assertTrue(app["tray"])
+        self.assertTrue(app["single_instance"])
+        self.assertTrue(DEFAULT_CONFIG["guard"]["auto_dial"])
+        self.assertTrue(DEFAULT_CONFIG["guard"]["kill_before_dial"])
+        # 没连 VPN 时要够灵敏：默认巡检间隔不超过 10 秒
+        self.assertLessEqual(DEFAULT_CONFIG["campus"]["interval"], 10)
+
+    def test_feature_switches_roundtrip(self):
+        C.save_rules({"kill_proxies": True, "processes": [], "wifi_policy": "off",
+                      "auto_dial": False, "kill_before_dial": False, "flip": {}})
+        r = C.load_rules(None)
+        self.assertFalse(r["auto_dial"])
+        self.assertFalse(r["kill_before_dial"])
+        C.save_rules({"kill_proxies": True, "processes": [], "wifi_policy": "off",
+                      "auto_dial": True, "kill_before_dial": True, "flip": {}})
+        self.assertTrue(C.load_rules(None)["auto_dial"])
+
     def test_network_choice_lifecycle(self):
         """手动切换网络的选择：切走要记住（自动逻辑让路），切回要清掉。"""
         self.assertEqual(C.get_network_choice(), "")

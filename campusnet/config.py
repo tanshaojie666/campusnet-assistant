@@ -83,13 +83,19 @@ DEFAULT_CLIENTS = [
 ]
 
 DEFAULT_CONFIG = {
+    # 程序自身的开关（都在界面「功能开关」里能改）
+    "app": {
+        "auto_update": True,      # 程序文件更新后自动重启生效
+        "tray": True,             # 点关闭只是收进托盘，程序继续后台跑
+        "single_instance": True,  # 同一时间只允许开一个
+    },
     "campus": {
         "mode": "wired",                 # wired=有线 / wireless=无线 / both
         "connection": "",                # PPPoE 连接名，留空自动探测
         "wifi_ssid": "",                 # 无线 SSID（wireless/both 时使用）
         "account": "",
         "password_enc": "",
-        "interval": 15,
+        "interval": 10,
         "probes": [],                    # 探测目标 [[host, port], ...]，留空自动用 PPP 的 DNS
         # Web 门户认证（有线、无线共用；很多学校的 Wi-Fi 连上后也要过网页认证）
         "portal": {
@@ -133,6 +139,8 @@ DEFAULT_CONFIG = {
     },
     "guard": {
         "kill_proxies": True,            # 连上校园网就关掉下面的进程
+        # 「自动连校园网」总开关：关掉后只监视不拨号（想自己手动控制时用）
+        "auto_dial": True,
         # 拨号前是否也先关掉代理/VPN（会抢路由、拦 DNS，导致拨号慢甚至拨不上）
         "kill_before_dial": True,
         "kill_processes": [
@@ -240,6 +248,7 @@ def rules_path(cfg=None) -> str:
 def load_rules(cfg=None):
     d = {"kill_proxies": True, "processes": list(DEFAULT_CONFIG["guard"]["kill_processes"]),
          "wifi_policy": "off", "reconnect_when_no_flip": False, "follow_vpn": False,
+         "auto_dial": True, "kill_before_dial": True,
          "vpn_hotspot_ssid": "", "flip": dict(DEFAULT_CONFIG["flip"])}
     data = json_load(rules_path(cfg) if cfg else RULES_FILE, None)
     if isinstance(data, dict):
@@ -251,6 +260,10 @@ def load_rules(cfg=None):
             d["reconnect_when_no_flip"] = bool(data["reconnect_when_no_flip"])
         if "follow_vpn" in data:
             d["follow_vpn"] = bool(data["follow_vpn"])
+        if "auto_dial" in data:
+            d["auto_dial"] = bool(data["auto_dial"])
+        if "kill_before_dial" in data:
+            d["kill_before_dial"] = bool(data["kill_before_dial"])
         if "vpn_hotspot_ssid" in data:
             d["vpn_hotspot_ssid"] = str(data["vpn_hotspot_ssid"] or "")
         if data.get("processes"):
@@ -270,6 +283,8 @@ def save_rules(rules):
     data["processes"] = [str(x).lower() for x in rules.get("processes", [])]
     data["wifi_policy"] = rules.get("wifi_policy", "off")
     data["reconnect_when_no_flip"] = bool(rules.get("reconnect_when_no_flip", False))
+    data["auto_dial"] = bool(rules.get("auto_dial", True))
+    data["kill_before_dial"] = bool(rules.get("kill_before_dial", True))
     data["follow_vpn"] = bool(rules.get("follow_vpn", False))
     data["vpn_hotspot_ssid"] = str(rules.get("vpn_hotspot_ssid") or "")
     data["flip"] = dict(rules.get("flip", {}))
@@ -334,7 +349,7 @@ def build_boot_config(cfg) -> dict:
         "password_machine": dpapi_encrypt(get_password(cfg), machine=True),
         "wired": wired,
         "portal": portal,
-        "interval": int(campus.get("interval") or 15),
+        "interval": int(campus.get("interval") or 10),
         "probes": campus.get("probes") or [],
         "kill_proxies": bool(guard.get("kill_proxies", True)),
         "processes": list(guard.get("kill_processes") or []),
