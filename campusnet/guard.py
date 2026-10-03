@@ -280,6 +280,19 @@ def boot_mode():
             ok, ip, why = prober.check(bind_ip=bind_ip or None)
             if os.environ.get("CNA_TEST_OFFLINE"):
                 ok = False                              # 仅自测用：假装掉线
+
+            # 关键一步：开了「没在翻墙就自动连回校园网」之后，
+            # **"校园网没连上"本身就是拨号信号** —— 哪怕手机热点让整台机器
+            # 整体是"在线"的。否则守护会以为"网络已恢复"而永远不去拨校园网，
+            # 表现就是"连着热点时校园网一直不上"。
+            campus_missing = bool(
+                reconnect_no_flip and connection and "pppoe" in wires
+                and not ppp_up and not pause_active(pause_file, cfg))
+            if campus_missing and ok:
+                boot_log("检测到正在使用别的网络（%s），但校园网没连上 → 仍按设置去拨校园网。"
+                         % (why or "其他网络"))
+                ok = False
+
             boot_heartbeat(ok, ip, why, campus=link_desc)
 
             if ok:
