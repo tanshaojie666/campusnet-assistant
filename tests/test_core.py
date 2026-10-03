@@ -366,6 +366,20 @@ class TestRuntimeSignals(unittest.TestCase):
                       "auto_dial": True, "kill_before_dial": True, "flip": {}})
         self.assertTrue(C.load_rules(None)["auto_dial"])
 
+    def test_task_registered_has_fallback(self):
+        """不能只看 schtasks 的退出码：普通权限下它会被拒绝 → 界面误报"守护没安装"。
+
+        实测踩到过：守护明明在跑（心跳正常），界面却说没安装。
+        所以判断逻辑里必须有开机配置 / 心跳的兜底。
+        """
+        import inspect
+        from campusnet import installer
+        src = inspect.getsource(installer.task_registered)
+        self.assertIn("schtasks", src)
+        self.assertIn("BOOT_CONFIG", src)
+        self.assertIn("heartbeat", src)
+        self.assertIsInstance(installer.task_registered(), bool)
+
     def test_network_choice_lifecycle(self):
         """手动切换网络的选择：切走要记住（自动逻辑让路），切回要清掉。"""
         self.assertEqual(C.get_network_choice(), "")

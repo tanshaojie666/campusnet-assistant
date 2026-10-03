@@ -102,8 +102,28 @@ def _ps_register(command: str, args: str, workdir: str) -> str:
 
 
 def task_registered() -> bool:
+    """计划任务是否已注册。
+
+    注意：**不能只看 schtasks 的退出码**。普通用户权限下 `schtasks /query`
+    有时会直接返回 "Access is denied"，于是界面会误报"守护没安装"——
+    而实际上守护跑得好好的。所以这里加了两级兜底：
+      1. schtasks 查询成功 → 已注册
+      2. 开机配置 + 守护心跳都在 → 也算已注册（说明确实装过并在跑）
+    """
     code, _ = run_cmd(["schtasks", "/query", "/tn", BOOT_TASK], timeout=30)
-    return code == 0
+    if code == 0:
+        return True
+    try:
+        from .config import BOOT_CONFIG, BOOT_HEARTBEAT
+        if os.path.isfile(BOOT_CONFIG) and os.path.isfile(BOOT_HEARTBEAT):
+            return True
+    except Exception:
+        pass
+    # 最后再看一眼心跳：文件被清理过但守护在跑，也认为已装
+    try:
+        return bool(heartbeat_state()[1])
+    except Exception:
+        return False
 
 
 def register_task(log=print):

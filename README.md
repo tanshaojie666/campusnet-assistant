@@ -574,6 +574,8 @@ CampusNetAssistant/
 ├─ scripts/
 │  ├─ install-boot.cmd       安装系统级守护（自动提权）
 │  ├─ uninstall-boot.cmd     卸载
+│  ├─ feature_check.py       全功能检查（88 项，真跑不模拟，见下）
+│  ├─ check_names.py         静态自查：用了但没定义/没导入的名字（CI 里跑）
 │  └─ publish_github.py      半自动发布脚本（见 PUBLISH.md，支持 --release 发版）
 ├─ docs/
 │  ├─ 使用说明.md            完整使用说明（大白话版，每个功能都讲到）
