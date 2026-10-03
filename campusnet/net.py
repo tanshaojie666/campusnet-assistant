@@ -578,6 +578,69 @@ def parse_login_form(html):
     return "", "", {}
 
 
+# --------------------------------------------------------------------------
+# 门户厂商预设：一键填好常见的字段名，剩下只要把地址换成你们学校门户的地址
+# 注意：字段名各校可能不同，预设只是省去敲一遍，仍建议按 docs/WIRED.md
+#       第四节的方法用 F12 抓一次真实登录请求核对。
+# --------------------------------------------------------------------------
+PORTAL_PRESETS = {
+    "auto": {
+        "label": "自动（先试这个）",
+        "note": "自动打开登录页、找表单、填账号密码并提交。适合页面是普通 HTML 表单的门户。",
+        "cfg": {"mode": "auto"},
+    },
+    "sangfor": {
+        "label": "深信服 Sangfor",
+        "note": "常见接口 /ac_portal/login.php。"
+                "注意 auth_tag 常是每次不同的一次性令牌，"
+                "固定模板可能不成功，这种情况请改用 script 先取令牌再提交。",
+        "cfg": {"mode": "template", "method": "post",
+                "url": "http://门户地址/ac_portal/login.php",
+                "body": "opr=pwdLogin&userName={username}&pwd={password}&auth_tag=",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"}},
+    },
+    "ruijie": {
+        "label": "锐捷 Ruijie",
+        "note": "常见接口 /eportal/InterFace.do?method=login。"
+                "service 和 queryString 通常要从登录页里取，可能需要用 script。",
+        "cfg": {"mode": "template", "method": "post",
+                "url": "http://门户地址/eportal/InterFace.do?method=login",
+                "body": "userId={username}&password={password}&service=&queryString=",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"}},
+    },
+    "drcom": {
+        "label": "城市热点 Dr.COM",
+        "note": "各校自建地址差异很大（有的用 GET 带 0/1 参数）。"
+                "先用自动；不行就照抓到的请求改地址和字段名。",
+        "cfg": {"mode": "template", "method": "post",
+                "url": "http://门户地址/drcom/login",
+                "body": "username={username}&password={password}",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"}},
+    },
+    "h3c": {
+        "label": "H3C",
+        "note": "常见接口 /portal/login，字段 userid / passwd。",
+        "cfg": {"mode": "template", "method": "post",
+                "url": "http://门户地址/portal/login",
+                "body": "userid={username}&passwd={password}",
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"}},
+    },
+}
+
+
+def apply_portal_preset(portal_cfg, preset):
+    """把厂商预设套到门户配置上（保留用户已填的账号密码）。"""
+    item = PORTAL_PRESETS.get(str(preset or "").lower())
+    out = dict(portal_cfg or {})
+    if not item:
+        return out, "未知预设"
+    keep = {k: out.get(k) for k in ("username", "password_enc", "password_machine",
+                                    "probe_url") if out.get(k)}
+    out.update(item["cfg"])
+    out.update(keep)
+    return out, item["note"]
+
+
 def portal_login(portal_cfg, username, password, log=None):
     """门户认证，三种方式：
 
