@@ -273,16 +273,194 @@ def wifi_profiles():
     return names
 
 
-def wifi_connect(ssid):
+def wifi_connect(ssid, interface=""):
     """连接指定 SSID（需要该 SSID 已保存过）。"""
     if not ssid:
         return False, "未配置 SSID"
-    code, out = run_cmd(["netsh", "wlan", "connect", "name=%s" % ssid], timeout=60)
+    args = ["netsh", "wlan", "connect", "name=%s" % ssid]
+    if interface:
+        args.append("interface=%s" % interface)
+    code, out = run_cmd(args, timeout=60)
     return code == 0, out
 
 
-def apply_wifi_policy(policy):
-    """off / manual（全部改成手动连接）/ disable（禁用无线网卡）。"""
+_WIFI_VISIBLE = {"t": 0.0, "names": []}
+_WIFI_MODE_CACHE = {}
+
+
+def wifi_visible_ssids(max_age=8.0):
+    """当前能扫到的无线名（用来判断"手机热点开了没"）。"""
+    now = time.time()
+    if now - _WIFI_VISIBLE.get("t", 0.0) < max_age:
+        return list(_WIFI_VISIBLE.get("names") or [])
+    names = []
+    code, out = run_cmd(["netsh", "wlan", "show", "networks"], timeout=30)
+    if code == 0:
+        for line in out.splitlines():
+            m = re.match(r"^\s*SSID\s+\d+\s*[:：]\s*(.+?)\s*$", line, re.I)
+            if m:
+                nm = m.group(1).strip()
+                if nm and nm not in names:
+                    names.append(nm)
+    _WIFI_VISIBLE.update({"t": now, "names": names})
+    return names
+
+
+def wifi_profile_mode(ssid, max_age=60.0):
+    """无线配置的连接模式：'auto'（Windows 会自己连）/ 'manual' / ''。
+
+    踩过的坑：以前直接解析 `ProgramData\\Microsoft\\Wlansvc\\...` 下的配置 XML，
+    **普通用户读不了**（Access denied）→ 永远返回空 →
+    自检里根本看不出"热点被设成了手动连接"，而你正是被这个坑住的：
+    手机热点开着，Windows 却永远不会自己连，只能手动切。
+    改成问 `netsh wlan show profile`（普通权限就能读）。
+    """
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return ""
+    now = time.time()
+    hit = _WIFI_MODE_CACHE.get(ssid)
+    if hit and now - hit[0] < max_age:
+        return hit[1]
+    mode = ""
+    code, out = run_cmd(["netsh", "wlan", "show", "profile", "name=%s" % ssid], timeout=30)
+    if code == 0:
+        for line in out.splitlines():
+            m = re.match(r"^\s*(?:连接模式|Connection mode)\s*[:：]\s*(.+?)\s*$", line, re.I)
+            if m:
+                raw = m.group(1).strip()
+                low = raw.lower()
+                if "manu" in low or "手动" in raw:
+                    mode = "manual"
+                elif "auto" in low or "自动" in raw:
+                    mode = "auto"
+                break
+    _WIFI_MODE_CACHE[ssid] = (now, mode)
+    return mode
+
+
+def set_wifi_profile_mode(ssid, mode="auto"):
+    """把无线配置设成自动 / 手动连接。返回 (是否成功, 输出)。"""
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return False, "没配置无线名"
+    val = "auto" if str(mode).lower().startswith("auto") else "manual"
+    code, out = run_cmd(["netsh", "wlan", "set", "profileparameter",
+                         "name=%s" % ssid, "connectionmode=%s" % val], timeout=30)
+    _WIFI_MODE_CACHE.pop(ssid, None)
+    return code == 0, out
+
+
+def wifi_profile_modes(names=None, max_age=60.0):
+    """{配置名: 'auto'/'manual'}，用 netsh 读（普通用户权限即可）。"""
+    if names is None:
+        names = wifi_profiles()
+    out = {}
+    for nm in names or []:
+        nm = str(nm or "").strip()
+        if nm:
+            out[nm] = wifi_profile_mode(nm, max_age=max_age)
+    return out
+
+
+def hotspot_diagnosis(ssid):
+    """一句话说清"为什么手机热点没连上"，给日志和自检用。"""
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return "没填热点名（到「校园网」页 → 跟着 VPN 走 → 翻墙时连接 里填）"
+    parts = []
+    if ssid not in wifi_profiles():
+        parts.append("无线配置里没有它（先手动连一次手机热点，Windows 会记住）")
+    else:
+        parts.append("连接模式=%s" % {"auto": "自动", "manual": "手动（Windows 不会自己连）"}
+                     .get(wifi_profile_mode(ssid), "读不到"))
+    cur = wifi_connected_ssid() or ""
+    if cur and cur.lower() == ssid.lower():
+        parts.append("当前已连上")
+    else:
+        parts.append("当前无线=%s" % (cur or "未连接"))
+        seen = wifi_visible_ssids()
+        if ssid in seen:
+            parts.append("热点在范围内（扫得到）")
+        else:
+            # 把现在能扫到的无线列出来 —— 手机上热点名被改过时，一眼就能发现
+            parts.append("没扫到它（手机热点没开 / 太远 / 只开了 5GHz）")
+            parts.append("现在扫到的无线：%s" % ("、".join(seen[:8]) if seen else "（一个都没有，"
+                                              "无线网卡是不是被禁用了？）"))
+    return "；".join(parts)
+
+
+def ensure_wifi_connected(ssid, timeout=60.0, log=None, force_auto=True):
+    """**自己把无线连上**，并盯到真的拿到 IP 为止。
+
+    这是"手机热点一开，电脑自己连，不用你动手"的核心：
+      1. 已经连着 → 直接返回
+      2. 配置不存在 → 说清楚原因（要先用手机连一次）
+      3. 无线网卡被禁用（可能是我们「禁用无线网卡」策略留下的）→ 先启用
+      4. **把这个热点改成"自动连接"** → 以后 Windows 自己就会连它，
+         不用等程序去催（这是关键：以前它被我们的"手动连接"策略锁死了）
+      5. 循环重试 `netsh wlan connect`，每 8 秒一次，直到拿到 IP 或超时
+    """
+    ssid = (ssid or "").strip()
+    say = log if callable(log) else (lambda *_a, **_k: None)
+    if not ssid:
+        return False, "没配置热点名"
+    if (wifi_connected_ssid() or "").strip().lower() == ssid.lower():
+        return True, "已经连着「%s」" % ssid
+    if ssid not in wifi_profiles():
+        return False, ("无线配置里没有「%s」：先在 Windows 里用手机热点连一次"
+                       "（记得勾「自动连接」），程序以后就能自己连了。" % ssid)
+    ifaces = wifi_interfaces() or []
+    if not ifaces:
+        return False, "没找到无线网卡"
+    if not any(adapter_enabled(n) for n in ifaces):
+        say("无线网卡是禁用状态 → 先启用它")
+        for nm in ifaces:
+            set_adapter_disabled(nm, False)
+        time.sleep(3)
+    if force_auto and wifi_profile_mode(ssid) != "auto":
+        ok_set, _out = set_wifi_profile_mode(ssid, "auto")
+        if ok_set:
+            say("已把无线「%s」改成自动连接 —— 以后 Windows 自己就会连它" % ssid)
+    deadline = time.time() + max(10.0, float(timeout))
+    last_try, tries, seen = 0.0, 0, False
+    while time.time() < deadline:
+        if (wifi_connected_ssid() or "").strip().lower() == ssid.lower():
+            for nm in ifaces:
+                if adapter_ip(nm):
+                    return True, "已连上「%s」（IP %s）" % (ssid, adapter_ip(nm))
+        if not seen and ssid in wifi_visible_ssids(max_age=4.0):
+            seen = True
+        if time.time() - last_try >= 8.0:
+            last_try = time.time()
+            tries += 1
+            for nm in ifaces:
+                wifi_connect(ssid, nm)
+            if tries == 1:
+                say("正在连接无线「%s」…%s" % (ssid, "" if seen else
+                                             "（现在还没扫到它，可能在热点开机范围内）"))
+        time.sleep(2)
+    cur = wifi_connected_ssid() or ""
+    if not seen and not cur:
+        why = "一直没扫到热点「%s」（手机热点没开、离得太远，或热点只开了 5GHz）" % ssid
+    elif cur and cur.lower() != ssid.lower():
+        why = "连上的是「%s」，不是「%s」（可能信号/密码问题）" % (cur, ssid)
+    elif cur:
+        why = "连上了「%s」但没拿到 IP（手机热点没开数据流量？）" % cur
+    else:
+        why = "热点在范围内，但一直没关联上（密码变了？信号太差？）"
+    return False, why
+
+
+def apply_wifi_policy(policy, keep_auto=()):
+    """off / manual（其余无线改成手动连接）/ disable（禁用无线网卡）。
+
+    **keep_auto**：这些无线保持/改成**自动连接**。必须把「翻墙时用的手机热点」
+    （以及校园网自己用的无线）传进来 —— 否则就成了：
+    我们一边要求程序自动连热点，一边又把这个热点设成"手动连接"，
+    结果 Windows 永远不会自己连，你只能手动切。**这正是实测踩到的坑。**
+    """
+    keep = [str(x).strip().lower() for x in (keep_auto or []) if str(x or "").strip()]
     if policy == "disable":
         code, _ = run_cmd(["netsh", "interface", "set", "interface", "WLAN", "admin=disable"],
                           timeout=30)
@@ -290,38 +468,25 @@ def apply_wifi_policy(policy):
     if policy != "manual":
         return 0, 0, ""
     names = wifi_profiles()
-    ok = 0
+    ok, kept = 0, []
     for nm in names:
-        code, _ = run_cmd(["netsh", "wlan", "set", "profileparameter",
-                           "name=%s" % nm, "connectionmode=manual"], timeout=30)
+        if nm.strip().lower() in keep:
+            code, _out = run_cmd(["netsh", "wlan", "set", "profileparameter",
+                                  "name=%s" % nm, "connectionmode=auto"], timeout=30)
+            if code == 0:
+                ok += 1
+                kept.append(nm)
+                _WIFI_MODE_CACHE.pop(nm, None)
+            continue
+        code, _out = run_cmd(["netsh", "wlan", "set", "profileparameter",
+                              "name=%s" % nm, "connectionmode=manual"], timeout=30)
         if code == 0:
             ok += 1
-    return ok, len(names), "已把 %d/%d 个无线配置改成手动连接" % (ok, len(names))
-
-
-def wifi_profile_modes():
-    """读无线配置里的连接模式（manual/auto），用于自检。"""
-    modes = {}
-    root = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"),
-                        r"Microsoft\Wlansvc\Profiles\Interfaces")
-    try:
-        import xml.etree.ElementTree as ET
-        for dirpath, _dirs, files in os.walk(root):
-            for f in files:
-                if not f.lower().endswith(".xml"):
-                    continue
-                try:
-                    tree = ET.parse(os.path.join(dirpath, f))
-                    r = tree.getroot()
-                    name = r.findtext("name") or ""
-                    mode = r.findtext("connectionMode") or ""
-                    if name:
-                        modes[name] = mode
-                except Exception:
-                    continue
-    except Exception:
-        pass
-    return modes
+            _WIFI_MODE_CACHE.pop(nm, None)
+    msg = "已处理 %d/%d 个无线配置（其中 %d 个保持自动连接）" % (ok, len(names), len(kept))
+    if kept:
+        msg += "：" + "、".join(kept[:3])
+    return ok, len(names), msg
 
 
 # --------------------------------------------------------------------------

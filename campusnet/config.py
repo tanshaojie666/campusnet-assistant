@@ -166,6 +166,10 @@ DEFAULT_CONFIG = {
         # **安全闸门**：断开校园网之前必须先确认"有别的能上网的路"（手机热点等）。
         # 没有就什么都不做 —— 否则一断校园网就彻底没网了。
         "require_other_network": True,
+        # **热点预连接**：手机热点一出现在范围内，就自己把电脑连上去
+        # （不用你去 Windows 的 Wi-Fi 列表里手动点）。
+        # 这样"打开浏览器 → 立刻翻墙"才真的是全自动。
+        "hotspot_preconnect": True,
     },
     "flip": {
         "enabled": False,                # 翻墙模式：打开指定程序就开 VPN
@@ -252,7 +256,7 @@ def load_rules(cfg=None):
     d = {"kill_proxies": True, "processes": list(DEFAULT_CONFIG["guard"]["kill_processes"]),
          "wifi_policy": "off", "reconnect_when_no_flip": False, "follow_vpn": False,
          "auto_dial": True, "kill_before_dial": True,
-         "vpn_hotspot_ssid": "", "require_other_network": True,
+         "vpn_hotspot_ssid": "", "require_other_network": True, "hotspot_preconnect": True,
          "flip": dict(DEFAULT_CONFIG["flip"])}
     data = json_load(rules_path(cfg) if cfg else RULES_FILE, None)
     if isinstance(data, dict):
@@ -272,6 +276,8 @@ def load_rules(cfg=None):
             d["vpn_hotspot_ssid"] = str(data["vpn_hotspot_ssid"] or "")
         if "require_other_network" in data:
             d["require_other_network"] = bool(data["require_other_network"])
+        if "hotspot_preconnect" in data:
+            d["hotspot_preconnect"] = bool(data["hotspot_preconnect"])
         if data.get("processes"):
             d["processes"] = [str(x).lower() for x in data["processes"]]
         if data.get("wifi_policy") in ("off", "manual", "disable"):
@@ -294,6 +300,7 @@ def save_rules(rules):
     data["follow_vpn"] = bool(rules.get("follow_vpn", False))
     data["vpn_hotspot_ssid"] = str(rules.get("vpn_hotspot_ssid") or "")
     data["require_other_network"] = bool(rules.get("require_other_network", True))
+    data["hotspot_preconnect"] = bool(rules.get("hotspot_preconnect", True))
     data["flip"] = dict(rules.get("flip", {}))
     json_dump(RULES_FILE, data)
     return True

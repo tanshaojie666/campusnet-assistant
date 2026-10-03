@@ -125,6 +125,14 @@ check("列出有线网卡", lambda: "、".join("%s(%s)" % (n, a) for n, a, _s in
 check("挑有线网卡", lambda: net.pick_wired_adapter({}) or "(没找到)")
 check("被禁用的有线网卡", lambda: "、".join(net.disabled_wired_adapters()) or "(无)")
 check("网卡启用状态", lambda: "以太网=%s" % net.adapter_enabled("以太网"))
+check("无线连接模式（普通权限就能读）",
+      lambda: "iPhone=%s" % (net.wifi_profile_mode("iPhone") or "(读不到)"))
+check("当前能扫到的无线",
+      lambda: "、".join(net.wifi_visible_ssids(max_age=0)[:6]) or "(一个都没扫到)")
+check("热点诊断（能不能自己连上，为什么）",
+      lambda: net.hotspot_diagnosis("iPhone")[:96])
+check("热点自动连接函数（空名字的安全分支）",
+      lambda: "%s" % (net.ensure_wifi_connected("", timeout=1),))
 check("列出 PPPoE 连接", lambda: "、".join(net.pppoe_connections()) or "(没有)")
 check("ppp_state", lambda: ("已连接 %s" % net.ppp_state("宽带连接")[1])
       if net.ppp_state("宽带连接")[0] else "未连接")

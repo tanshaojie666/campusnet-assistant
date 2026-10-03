@@ -621,5 +621,93 @@ class TestBootConfig(unittest.TestCase):
         self.assertNotIn("password_enc", boot["wired"]["portal"])
 
 
+class TestHotspotAutoConnect(unittest.TestCase):
+    """手机热点"自己连"这一整套 —— 修的是"热点开着还得手动切"的真 bug。
+
+    根因：我们自己的「无线策略=把所有无线改成手动连接」把手机热点也改成了手动，
+    于是 Windows 永远不会自己连热点，用户只能手动去 Wi-Fi 列表点。
+    """
+
+    def _clear_caches(self):
+        from campusnet import net
+        net._WIFI_MODE_CACHE.clear()
+        net._WIFI_VISIBLE["t"] = 0.0
+        net._WIFI_VISIBLE["names"] = []
+
+    def test_profile_mode_read_via_netsh(self):
+        """连接模式必须从 netsh 读（普通权限）—— 以前读 ProgramData 永远读不到。"""
+        from unittest import mock
+        from campusnet import net
+        self._clear_caches()
+        out = ("配置文件 iPhone 的接口信息\n====\n"
+               "    连接模式             : 手动连接\n")
+        with mock.patch.object(net, "run_cmd", return_value=(0, out)):
+            self._clear_caches()
+            self.assertEqual(net.wifi_profile_mode("iPhone"), "manual")
+        out2 = ("    Connection mode    : Connect automatically\n")
+        with mock.patch.object(net, "run_cmd", return_value=(0, out2)):
+            self._clear_caches()
+            self.assertEqual(net.wifi_profile_mode("iPhone"), "auto")
+
+    def test_policy_keeps_hotspot_auto(self):
+        """「无线策略=手动」必须放过手机热点和校园网无线，否则功能自相矛盾。"""
+        from unittest import mock
+        from campusnet import net
+        calls = []
+
+        def fake(args, timeout=30, **_kw):
+            calls.append(list(args))
+            return 0, ""
+
+        with mock.patch.object(net, "wifi_profiles",
+                               return_value=["iPhone", "CMCC-NXM5", "xd-wlan"]), \
+                mock.patch.object(net, "run_cmd", side_effect=fake):
+            ok, total, msg = net.apply_wifi_policy("manual", keep_auto=["iPhone", "xd-wlan"])
+        self.assertEqual((ok, total), (3, 3))
+        auto = [c for c in calls if "connectionmode=auto" in c]
+        manual = [c for c in calls if "connectionmode=manual" in c]
+        self.assertEqual(len(auto), 2, calls)
+        self.assertEqual(len(manual), 1, calls)
+        self.assertTrue(any("name=iPhone" in c for c in auto), calls)
+        self.assertIn("保持自动连接", msg)
+
+    def test_ensure_connected_when_already_on(self):
+        from unittest import mock
+        from campusnet import net
+        with mock.patch.object(net, "wifi_connected_ssid", return_value="iPhone"):
+            ok, why = net.ensure_wifi_connected("iPhone", timeout=1)
+        self.assertTrue(ok)
+        self.assertIn("iPhone", why)
+
+    def test_ensure_connected_missing_profile_gives_actionable_reason(self):
+        from unittest import mock
+        from campusnet import net
+        with mock.patch.object(net, "wifi_connected_ssid", return_value=""), \
+                mock.patch.object(net, "wifi_profiles", return_value=["CMCC-NXM5"]):
+            ok, why = net.ensure_wifi_connected("iPhone", timeout=1)
+        self.assertFalse(ok)
+        self.assertIn("无线配置里没有", why)
+
+    def test_visible_ssids_parsing(self):
+        from unittest import mock
+        from campusnet import net
+        self._clear_caches()
+        out = ("接口名称 : WLAN\n\nSSID 1 : iPhone\n    网络类型 : 基础结构\n"
+               "SSID 2 : CMCC-NXM5\n")
+        with mock.patch.object(net, "run_cmd", return_value=(0, out)):
+            self._clear_caches()
+            names = net.wifi_visible_ssids()
+        self.assertEqual(names, ["iPhone", "CMCC-NXM5"])
+
+    def test_preconnect_defaults_on(self):
+        """热点预连接默认开着（用户要的就是"我自己不用动手"）。"""
+        C.save_rules({"flip": {}})
+        self.assertTrue(C.load_rules(None).get("hotspot_preconnect", True))
+        self.assertTrue(DEFAULT_CONFIG["guard"]["hotspot_preconnect"])
+        C.save_rules({"flip": {}, "hotspot_preconnect": False})
+        self.assertFalse(C.load_rules(None)["hotspot_preconnect"])
+        C.save_rules({"flip": {}, "hotspot_preconnect": True})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

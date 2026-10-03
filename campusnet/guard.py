@@ -21,10 +21,10 @@ from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
                      set_disabled_adapter, set_pause)
 from .clients import scan_clients
 from .net import (adapter_ip, apply_wifi_policy, campus_link_state, clear_stale_dials,
-                  friendly_error, pppoe_connections, ppp_state, ppp_state_cached,
-                  ras_dial, ras_hangup, reset_ras, set_adapter_disabled,
-                  wifi_connected_ssid, wifi_profiles, wired_adapters, wired_auth_list,
-                  wired_authenticate, wired_bind_ip)
+                  ensure_wifi_connected, friendly_error, pppoe_connections, ppp_state,
+                  ppp_state_cached, ras_dial, ras_hangup, reset_ras, set_adapter_disabled,
+                  wifi_connected_ssid, wifi_profiles, wifi_visible_ssids, wired_adapters,
+                  wired_auth_list, wired_authenticate, wired_bind_ip)
 from .net import build_prober
 from .rules import kill_processes
 from .util import list_processes, named_mutex, pids_of, sleep_interruptible
@@ -112,6 +112,7 @@ def boot_mode():
     except (TypeError, ValueError):
         vpn_switch_delay = 10
     vpn_last_on = 0.0               # 最近一次"检测到在用代理"的时间
+    last_hotspot_pre = 0.0          # 上次"预连接手机热点"的尝试时间（节流用）
     vpn_restored = False            # 这一轮翻墙结束后是否已经把校园网切回来了
     auto_dial = bool(guard_cfg.get("auto_dial", True))
     kill_before_dial = bool(guard_cfg.get("kill_before_dial", True))
@@ -185,10 +186,31 @@ def boot_mode():
             procs_snapshot = list_processes() or {}
 
             if wifi_policy != "off" and time.time() - last_wifi > 600:
-                _ok, _total, msg = apply_wifi_policy(wifi_policy)
+                # ★ 关键：把「翻墙时用的手机热点」和「校园网无线」排除在"改手动连接"之外，
+                # 否则我们一边要程序自动连热点、一边又把它设成手动 → Windows 永远不会自己连，
+                # 用户只能手动去 Wi-Fi 列表里点（实测踩到过这个自相矛盾的坑）。
+                _ok, _total, msg = apply_wifi_policy(wifi_policy,
+                                                     keep_auto=[vpn_hotspot_ssid, wifi_ssid])
                 if msg:
                     boot_log(msg)
                 last_wifi = time.time()
+
+            # ★ 热点预连接：手机热点一出现在范围内，就自己把电脑连上去。
+            # 这样等打开浏览器时"替代网络"已经就绪 → 翻墙立刻生效，全程不用动手。
+            if (follow_vpn and vpn_hotspot_ssid
+                    and bool(rules.get("hotspot_preconnect", True))
+                    and get_network_choice(cfg) != "none"
+                    and not pause_active(pause_file, cfg)
+                    and time.time() - last_hotspot_pre > 90):
+                last_hotspot_pre = time.time()
+                _want = vpn_hotspot_ssid.strip()
+                _cur = (wifi_connected_ssid() or "").strip()
+                if _cur.lower() != _want.lower() and _want in wifi_visible_ssids():
+                    boot_log("热点预连接：扫到「%s」，正在自己连上去（不用手动切）…" % _want)
+                    _ok_hs, _why_hs = ensure_wifi_connected(_want, timeout=30, log=boot_log)
+                    link_cache["t"] = 0
+                    boot_log("热点预连接：「%s」%s（%s）"
+                             % (_want, "已连上" if _ok_hs else "没连上", _why_hs))
 
             # 处理界面发来的「断开」请求 —— **必须放在循环最前面**。
             # 为什么：校园网拨号是守护以 SYSTEM 身份建立的，界面（普通用户权限）
@@ -278,15 +300,16 @@ def boot_mode():
                         else:
                             boot_log("翻墙中 → 已断开校园网（%s 已释放）。" % (ip2 or "IP"))
                         link_cache["t"] = 0
-                    # 保证有网：连上指定的无线（手机热点）
+                    # 保证有网：连上指定的无线（手机热点）—— 自己连，并盯到真的拿到 IP
                     if vpn_hotspot_ssid:
-                        from .net import wifi_connect, wifi_connected_ssid
-                        cur = (wifi_connected_ssid() or "").strip()
-                        if cur.lower() != vpn_hotspot_ssid.lower():
-                            boot_log("翻墙中 → 连接无线「%s」保证有网。" % vpn_hotspot_ssid)
-                            wifi_connect(vpn_hotspot_ssid)
-                            time.sleep(5)
-                            link_cache["t"] = 0
+                        _ok_hs, _why_hs = ensure_wifi_connected(vpn_hotspot_ssid, timeout=45,
+                                                                log=boot_log)
+                        if _ok_hs:
+                            boot_log("翻墙中 → %s" % _why_hs)
+                        else:
+                            boot_log("翻墙中 → 自动连「%s」没成功：%s"
+                                     % (vpn_hotspot_ssid, _why_hs))
+                        link_cache["t"] = 0
                 elif (vpn_last_on and not vpn_restored
                       and (time.time() - vpn_last_on) >= vpn_switch_delay):
                     vpn_restored = True
@@ -664,8 +687,14 @@ def selftest(cfg) -> int:
         ok_alt, why_alt = other_network_available(cfg, hs)
         print("   替代网络（翻墙前必须先有）：", ("有 - " if ok_alt else "没有 - ") + why_alt)
         if hs:
+            from .net import hotspot_diagnosis, wifi_profile_mode
             saved = hs in wifi_profiles()
             print("     手机热点：", hs, "｜已保存过该热点：", "是" if saved else "否（要先连一次）")
+            print("     热点诊断：", hotspot_diagnosis(hs))
+            if wifi_profile_mode(hs) == "manual":
+                print("     ⚠ 它现在是「手动连接」→ Windows 永远不会自己连它。")
+                print("        打开程序界面、在「校园网」页保存一次设置就会自动改回「自动连接」，")
+                print("        或者勾上「热点一开就自动连」让它以后一直自动化。")
     print(line)
     print("2) 密码")
     from .config import get_password, portal_credentials

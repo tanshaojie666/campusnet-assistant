@@ -27,9 +27,10 @@ from .config import (APP_TITLE, CONFIG_FILE, HOME_DIR, LOG_FILE, clear_disconnec
                      set_account, set_flip_active, set_pause)
 from .guard import boot_task_registered
 from .installer import install_boot, uninstall_boot
-from .net import (build_prober, campus_link_state, other_network_available,
-                  pppoe_connections, ppp_state,
-                  ras_dial, ras_hangup, wifi_connect, wifi_profiles)
+from .net import (build_prober, campus_link_state, ensure_wifi_connected,
+                  hotspot_diagnosis, other_network_available, pppoe_connections, ppp_state,
+                  ras_dial, ras_hangup, set_wifi_profile_mode, wifi_connect,
+                  wifi_connected_ssid, wifi_profile_mode, wifi_profiles, wifi_visible_ssids)
 from .clients import ensure_client_ready
 from .rules import flip_triggered
 from .util import TrayIcon, create_no_window_flag, dpapi_decrypt, dpapi_encrypt, \
@@ -262,10 +263,27 @@ class App:
         ttk.Label(frow, text="翻墙时连接：").pack(side="left")
         self.vpn_ssid_var = tk.StringVar(
             value=self.cfg["guard"].get("vpn_hotspot_ssid") or "")
+        # 下拉里既列"已保存过的无线"，也列"现在能扫到的无线" ——
+        # 手机上热点名改过 / 还没手动连过时，可以直接从扫到的里面挑。
+        try:
+            _seen = wifi_visible_ssids(max_age=0)
+        except Exception:
+            _seen = []
+        _ssid_choices = []
+        for _n in list(wifi_profiles()) + list(_seen):
+            if _n and _n not in _ssid_choices:
+                _ssid_choices.append(_n)
         ttk.Combobox(frow, textvariable=self.vpn_ssid_var, font=self.font, width=26,
-                     values=wifi_profiles()).pack(side="left", padx=6)
-        ttk.Label(frow, text="（手机热点名；留空=不主动连）",
+                     values=_ssid_choices).pack(side="left", padx=6)
+        ttk.Label(frow, text="（手机热点名；留空=不主动连。下拉里含「现在扫到的」）",
                   foreground="#5f6368").pack(side="left")
+
+        # ★ 热点一开就自动连：解决"热点开着还得自己去 Wi-Fi 列表点一下"的问题
+        self.preconnect_var = tk.BooleanVar(
+            value=bool(self.cfg["guard"].get("hotspot_preconnect", True)))
+        ttk.Checkbutton(kill, variable=self.preconnect_var,
+                        text="热点一开就自动连：扫到上面的热点就自己连上去，"
+                             "不用你手动去 Windows 的 Wi-Fi 列表里点").pack(anchor="w", pady=(6, 0))
 
         # ★ 安全闸门：没有替代网络就绝不动校园网
         self.require_net_var = tk.BooleanVar(
@@ -1240,6 +1258,7 @@ class App:
         cfg["guard"]["follow_vpn"] = bool(self.follow_vpn_var.get())
         cfg["guard"]["vpn_hotspot_ssid"] = self.vpn_ssid_var.get().strip()
         cfg["guard"]["require_other_network"] = bool(self.require_net_var.get())
+        cfg["guard"]["hotspot_preconnect"] = bool(self.preconnect_var.get())
         cfg["guard"]["auto_dial"] = bool(self.auto_dial_var.get())
         cfg["guard"]["kill_before_dial"] = bool(self.kill_before_var.get())
         cfg.setdefault("app", {})
@@ -1266,6 +1285,7 @@ class App:
         rules["follow_vpn"] = cfg["guard"]["follow_vpn"]
         rules["vpn_hotspot_ssid"] = cfg["guard"]["vpn_hotspot_ssid"]
         rules["require_other_network"] = cfg["guard"]["require_other_network"]
+        rules["hotspot_preconnect"] = cfg["guard"]["hotspot_preconnect"]
         rules["auto_dial"] = cfg["guard"]["auto_dial"]
         rules["kill_before_dial"] = cfg["guard"]["kill_before_dial"]
         rules["flip"] = cfg["flip"]
@@ -1317,8 +1337,48 @@ class App:
         try:
             self.collect_config()
             self.log("设置已保存（系统级守护会在 15 秒内读到新规则）", "ok")
+            # 勾了「跟着 VPN 走」+「热点一开就自动连」→ 立刻把这个热点改回"自动连接"
+            # 并试着连上。不然它可能还留着我们以前设的"手动连接"，
+            # Windows 就永远不会自己连 —— 用户只能手动去点（本次修的正是这个）。
+            if (self.follow_vpn_var.get() and self.preconnect_var.get()
+                    and (self.vpn_ssid_var.get() or "").strip()):
+                self._auto_connect_hotspot(timeout=40, quiet=True)
         except Exception as exc:  # noqa: BLE001
             self.log("保存失败：%s" % exc, "err")
+
+    # ---- 手机热点自动连接 ----
+    _hotspot_thread = None
+
+    def _auto_connect_hotspot(self, timeout=45, quiet=False):
+        """后台把配好的手机热点连上（不卡界面）。
+
+        返回是否已经开始尝试（已经在试也返回 True）。
+        顺带把它改回"自动连接"：这样即使程序没跑，Windows 自己也会连它。
+        """
+        ssid = (self.vpn_ssid_var.get() or "").strip()
+        if not ssid:
+            return False
+        if self._hotspot_thread is not None and self._hotspot_thread.is_alive():
+            return True                      # 已经在连了
+
+        def work():
+            try:
+                if wifi_profile_mode(ssid) != "auto":
+                    ok_set, _o = set_wifi_profile_mode(ssid, "auto")
+                    if ok_set:
+                        self.log("已把无线「%s」改成自动连接 —— 以后 Windows 自己就会连它"
+                                 % ssid, "ok")
+                ok, why = ensure_wifi_connected(ssid, timeout=timeout, log=self.log)
+                if ok:
+                    self.log("手机热点「%s」已自动连上：%s" % (ssid, why), "ok")
+                elif not quiet:
+                    self.log("手机热点「%s」自动连接没成功：%s" % (ssid, why), "warn")
+            except Exception as exc:  # noqa: BLE001
+                self.log("自动连接热点出错（已忽略）：%s" % exc, "warn")
+
+        self._hotspot_thread = threading.Thread(target=work, daemon=True)
+        self._hotspot_thread.start()
+        return True
 
     def connect(self, force=False):
         """立即连接：取消"先别拨"暂停、断开请求和手动切换选择，然后开始拨号。"""
@@ -1503,11 +1563,26 @@ class App:
         wait_until = 0.0        # 「跟着 VPN 走」时：等校园网断开再开代理的截止时间
         told_net = 0.0          # "正在试着连热点"这条日志的节流
         alt_until = 0.0         # 等手机热点关联+拿地址的截止时间
+        last_pre = 0.0          # 热点预连接的节流
         while not self.stop_event.is_set():
             try:
                 rules = load_rules(None)
                 flip = rules.get("flip") or {}
                 policy = str(flip.get("when") or "off_campus").lower()
+
+                # ★ 热点预连接（全自动的关键）：
+                # 只要「跟着 VPN 走」开着、填了热点名，就把热点自己连上 ——
+                # 手机热点一出现，电脑自己就上去了，你什么都不用点。
+                _want_hs = str(rules.get("vpn_hotspot_ssid") or "").strip()
+                if (rules.get("follow_vpn") and bool(rules.get("hotspot_preconnect", True))
+                        and _want_hs and not pause_active()
+                        and time.time() - last_pre > 45):
+                    last_pre = time.time()
+                    if (wifi_connected_ssid() or "").strip().lower() != _want_hs.lower():
+                        if self._auto_connect_hotspot(timeout=30, quiet=True):
+                            pass
+                        else:
+                            self.log("没填热点名，无法自动连（「校园网」页 → 翻墙时连接）", "warn")
 
                 # 维护"翻墙模式在用代理"标记：活着就刷新，死了就撤掉
                 if own_key:
@@ -1542,21 +1617,16 @@ class App:
                                 ok_net, why = other_network_available(self.cfg, hotspot)
                                 if not ok_net and hotspot and time.time() - told_net > 60:
                                     told_net = time.time()
-                                    self.log("检测到 %s：翻墙要先有别的网，正在连「%s」并等它拿地址"
-                                             "（最多等 30 秒）…" % (what, hotspot), "warn")
-                                    try:
-                                        if hotspot in wifi_profiles():
-                                            # 不在这里 sleep（会把界面卡住）：
-                                            # 发起连接后交给下面的 tick 反复检查
-                                            wifi_connect(hotspot)
-                                            alt_until = time.time() + 30
-                                        else:
-                                            self.log("提示：无线配置里没有「%s」这个热点。"
-                                                     "先用手机连一次、勾上「自动连接」，"
-                                                     "或把界面上填的热点名改成一致的。"
-                                                     % hotspot, "warn")
-                                    except Exception as exc:
-                                        self.log("连接热点出错：%s" % exc, "warn")
+                                    self.log("检测到 %s：翻墙要先有别的网，正在自动连「%s」"
+                                             "（最多等 60 秒，不用你手动切）…" % (what, hotspot),
+                                             "warn")
+                                    # 后台线程去连（会重试 + 把它改成"自动连接"），
+                                    # 这里只负责等，不阻塞界面
+                                    if self._auto_connect_hotspot(timeout=60, quiet=True):
+                                        alt_until = time.time() + 75
+                                    else:
+                                        self.log("热点诊断：%s" % hotspot_diagnosis(hotspot),
+                                                 "warn")
                                 if alt_until and not ok_net:
                                     if time.time() < alt_until:
                                         ok_net = None      # 等待中：校园网先不动，也不报"没有可用网络"
@@ -1571,10 +1641,14 @@ class App:
                                 # 没有替代网络 → 校园网不动、翻墙不开
                                 if time.time() - told > 180:
                                     told = time.time()
+                                    diag = ("\n　热点诊断：%s" % hotspot_diagnosis(hotspot)) \
+                                        if hotspot else ""
                                     self.log("检测到 %s，但**没有可用的热点/其他网络**（%s）→ "
-                                             "校园网保持连接，翻墙也不开。\n"
-                                             "　想翻墙：先把手机热点打开、让电脑连上，"
-                                             "再打开浏览器就行。" % (what, why), "warn")
+                                             "校园网保持连接，翻墙也不开。%s\n"
+                                             "　想翻墙：把手机热点打开"
+                                             "（在手机上把「设置 → 个人热点」页面开着几秒）"
+                                             "就行，程序会自己连上去；再打开浏览器即可。"
+                                             % (what, why, diag), "warn")
                                 allowed = False
                             else:
                                 if not wait_until:
