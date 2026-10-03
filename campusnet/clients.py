@@ -278,6 +278,10 @@ def ensure_client_ready(cfg, order, log=None, wait_rounds=10):
             log(m)
 
     hints = (cfg.get("flip") or {}).get("region_hints") or []
+    order = [k for k in (order or []) if client_by_id(cfg, k)]
+    if not order:
+        _log("没有勾选任何翻墙客户端 → 请到「翻墙模式」页把要用的客户端勾上。")
+        return False, "", "", ""
     for key in order:
         c = client_by_id(cfg, key)
         if not c:
