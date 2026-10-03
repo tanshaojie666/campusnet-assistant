@@ -78,19 +78,24 @@ def ras_hangup(entry, phonebook=None):
     return run_cmd(args, timeout=60)
 
 
-def clear_stale_dials():
-    """清理卡住的 rasdial 进程。
+def clear_stale_dials(max_age=90):
+    """清理**卡住**的 rasdial 进程（只清理启动超过 max_age 秒的）。
 
     为什么需要：只要有一个 rasdial 卡住没退出，后面每次拨号都会立刻报
-    **756「已经有一个拨号连接在进行中」**，而且会一直卡下去 ——
-    表现就是"校园网怎么都连不回来"。拨号前先清一遍最省事。
+    **756「已经有一个拨号连接在进行中」**。
+
+    为什么限年龄：正常拨号只要几秒到十几秒。如果把**正在拨号**的进程也杀掉，
+    用户看到的就是 `错误 1：正在连接到 宽带连接...` 这种莫名其妙的结果
+    —— 而这个误杀真实发生过（界面和守护同时拨号时互相杀）。
     """
-    from .util import list_processes, pids_of, terminate_pid
+    from .util import list_processes, pids_of, process_age_seconds, terminate_pid
     procs = list_processes() or {}
     killed = 0
     for pid in pids_of(procs, "rasdial.exe"):
-        if terminate_pid(pid):
-            killed += 1
+        age = process_age_seconds(pid)
+        if age is None or age >= max_age:
+            if terminate_pid(pid):
+                killed += 1
     return killed
 
 

@@ -522,6 +522,50 @@ def clear_network_choice(boot_cfg=None):
 
 
 # --------------------------------------------------------------------------
+# 连接请求
+#
+# 界面点「立即连接」时写这个文件，让**系统级守护**去拨号，而不是界面自己拨：
+#   1. 守护才有权限恢复被禁用的网卡（界面没有）；
+#   2. 两边同时拨号会互相杀进程 —— 实测会出现
+#      `错误 1：正在连接到 宽带连接...`（正在拨号的 rasdial 被另一边清掉了）。
+# --------------------------------------------------------------------------
+CONNECT_FILE = "connect.request"
+
+
+def connect_path(boot_cfg=None):
+    base = HOME_DIR
+    if boot_cfg and boot_cfg.get("user_rules"):
+        base = os.path.dirname(boot_cfg["user_rules"])
+    return os.path.join(base, CONNECT_FILE)
+
+
+def request_connect(note=""):
+    path = connect_path(None)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("%.0f\t%s" % (time.time(), note or ""))
+        return True
+    except Exception:
+        return False
+
+
+def connect_requested(boot_cfg=None):
+    try:
+        with open(connect_path(boot_cfg), "r", encoding="utf-8-sig") as fh:
+            return bool(fh.read().strip())
+    except Exception:
+        return False
+
+
+def clear_connect(cfg=None):
+    try:
+        os.remove(connect_path(cfg))
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
 # 「翻墙模式正在用代理」标记
 #
 # 翻墙模式打开代理后会写这个文件；系统级守护读到它（且足够新）就**不关代理**，

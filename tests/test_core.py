@@ -304,6 +304,28 @@ class TestRuntimeSignals(unittest.TestCase):
         C.clear_disabled_adapter()
         C.clear_flip_active()
         C.clear_network_choice()
+        C.clear_connect()
+
+    def test_connect_request_lifecycle(self):
+        """界面点「立即连接」→ 写连接请求 → 守护执行后清掉。"""
+        self.assertFalse(C.connect_requested())
+        self.assertTrue(C.request_connect("测试"))
+        self.assertTrue(C.connect_requested())
+        C.clear_connect()
+        self.assertFalse(C.connect_requested())
+
+    def test_process_age_is_sane(self):
+        """进程年龄检测（用来区分"正在拨号"和"卡住的拨号"）。"""
+        import os
+        from campusnet.util import process_age_seconds
+        age = process_age_seconds(os.getpid())
+        self.assertIsNotNone(age)
+        self.assertGreaterEqual(age, 0)
+        self.assertLess(age, 86400)
+
+    def test_process_age_of_missing_pid(self):
+        from campusnet.util import process_age_seconds
+        self.assertIsNone(process_age_seconds(0x7FFFFFFF))
 
     def test_network_choice_lifecycle(self):
         """手动切换网络的选择：切走要记住（自动逻辑让路），切回要清掉。"""

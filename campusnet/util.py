@@ -538,6 +538,42 @@ def json_load(path, default=None):
         return default
 
 
+def process_age_seconds(pid):
+    """进程已经启动了多少秒（拿不到返回 None）。
+
+    用途：清理"卡住的拨号进程"时必须区分开 ——
+    正常拨号只要几秒到十几秒；如果把**正在拨号**的进程杀掉，
+    用户会看到 `错误 1：正在连接到 宽带连接...` 这种莫名其妙的结果。
+    """
+    try:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = ctypes.c_void_p
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+
+        class FILETIME(ctypes.Structure):
+            _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                        ("dwHighDateTime", wintypes.DWORD)]
+
+        h = k.OpenProcess(0x1000, False, int(pid))     # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return None
+        try:
+            created, _exit, _k, _u = FILETIME(), FILETIME(), FILETIME(), FILETIME()
+            if not k.GetProcessTimes(ctypes.c_void_p(h), ctypes.byref(created),
+                                     ctypes.byref(_exit), ctypes.byref(_k), ctypes.byref(_u)):
+                return None
+            now = FILETIME()
+            k.GetSystemTimeAsFileTime(ctypes.byref(now))
+            c = (created.dwHighDateTime << 32) | created.dwLowDateTime
+            n = (now.dwHighDateTime << 32) | now.dwLowDateTime
+            return max(0.0, (n - c) / 1e7)
+        finally:
+            k.CloseHandle(ctypes.c_void_p(h))
+    except Exception:
+        return None
+
+
 def system_uptime_seconds():
     """系统已经运行了多少秒（用 GetTickCount64，不需要管理员权限）。
 

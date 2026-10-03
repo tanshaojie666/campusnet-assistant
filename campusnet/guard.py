@@ -13,10 +13,12 @@ import os
 import time
 
 from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
-                     boot_heartbeat, boot_log, clear_disabled_adapter, clear_disconnect,
-                     clear_pause, disabled_adapter_path, disconnect_requested, flip_active,
-                     get_disabled_adapter, get_network_choice, heartbeat_state,
-                     load_boot_config, load_rules, pause_active, set_disabled_adapter)
+                     boot_heartbeat, boot_log, clear_connect, clear_disabled_adapter,
+                     clear_disconnect, clear_network_choice, clear_pause,
+                     connect_requested, disabled_adapter_path, disconnect_requested,
+                     flip_active, get_disabled_adapter, get_network_choice,
+                     heartbeat_state, load_boot_config, load_rules, pause_active,
+                     set_disabled_adapter)
 from .clients import scan_clients
 from .net import (adapter_ip, apply_wifi_policy, campus_link_state, clear_stale_dials,
                   friendly_error, pppoe_connections, ppp_state, ppp_state_cached,
@@ -200,6 +202,22 @@ def boot_mode():
                 link_cache["t"] = 0
                 link_started = 0.0
                 boot_heartbeat(False, "", "已按请求断开校园网")
+
+            # 处理界面发来的「连接」请求：交给守护来做，而不是界面自己拨。
+            # 原因有二：守护才有权限恢复被禁用的网卡；两边同时拨号会互相杀进程
+            # （实测会出现 `错误 1：正在连接到 宽带连接...`）。
+            if connect_requested(cfg):
+                clear_connect(cfg)
+                clear_pause(cfg)
+                clear_network_choice(cfg)
+                from .net import enable_disabled_wired_adapters
+                fixed = enable_disabled_wired_adapters(boot_log)
+                boot_log("收到「连接」请求 → %s立即拨号。"
+                         % ("已恢复网卡，" if fixed else ""))
+                link_cache["t"] = 0
+                link_started = 0.0
+                last_dial_ts = 0.0          # 允许本轮立刻拨
+                time.sleep(2 if fixed else 0)
 
             # 「立即连接」后把上次断开时禁用的网卡恢复回来。
             # 这里**不依赖"禁用了哪块"的记录**：记录一旦丢失，网卡就会一直禁用，

@@ -1239,21 +1239,29 @@ class App:
             auths = [k for k, v in self.wired_vars.items() if v.get()]
             if s["mode"] in ("wired", "both"):
                 if "pppoe" in auths and s["connection"]:
-                    self.log("正在拨号（%s）…" % s["connection"])
-                    ras_hangup(s["connection"])
-                    code, text = ras_dial(s["connection"], s["account"], s["password"])
-                    if code != 0:
-                        from .net import disabled_wired_adapters, friendly_error
-                        if code == 756 and disabled_wired_adapters():
-                            # 网卡被禁用时界面自己拨不动（守护才恢复得了），
-                            # 这里给个明确提示，别让人以为程序坏了
-                            self.log("有线网卡当前是禁用状态，界面拨不了 —— "
-                                     "系统级守护会在 15 秒内把它启用并拨号，稍等一下即可。",
-                                     "warn")
-                        else:
-                            self.log("拨号失败 → " + friendly_error(code, text), "err")
+                    # 系统级守护在跑就交给它拨：它权限足、能恢复被禁用的网卡、
+                    # 还能清卡死状态；而且**两边同时拨号会互相杀进程**
+                    # （实测会出现"错误 1：正在连接到 宽带连接..."）。
+                    alive, _desc = heartbeat_state()
+                    if alive:
+                        from .config import request_connect
+                        request_connect("界面点了立即连接")
+                        self.log("已请系统级守护去拨号（约 15 秒内生效）——"
+                                 "它权限更足，万一网卡被禁用也能恢复。", "ok")
                     else:
-                        self.log("拨号成功。", "ok")
+                        self.log("正在拨号（%s）…" % s["connection"])
+                        ras_hangup(s["connection"])
+                        code, text = ras_dial(s["connection"], s["account"], s["password"])
+                        if code != 0:
+                            from .net import disabled_wired_adapters, friendly_error
+                            if code == 756 and disabled_wired_adapters():
+                                self.log("有线网卡当前是禁用状态，界面拔不了号 —— "
+                                         "双击「③ 安装开机自动连」装好守护后它才能自动恢复。",
+                                         "warn")
+                            else:
+                                self.log("拨号失败 → " + friendly_error(code, text), "err")
+                        else:
+                            self.log("拨号成功。", "ok")
                 elif any(a in auths for a in ("dhcp", "static", "portal", "client", "lan", "restart")):
                     from .net import wired_authenticate
                     self.log("按配置接入有线（%s）…" % "+".join(auths))
