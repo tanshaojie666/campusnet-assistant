@@ -13,13 +13,15 @@ import os
 import time
 
 from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
-                     boot_heartbeat, boot_log, flip_active, heartbeat_state,
-                     load_boot_config, load_rules, pause_active)
+                     boot_heartbeat, boot_log, clear_disabled_adapter, clear_disconnect,
+                     clear_pause, disconnect_requested, flip_active, get_disabled_adapter,
+                     heartbeat_state, load_boot_config, load_rules, pause_active,
+                     set_disabled_adapter)
 from .clients import scan_clients
 from .net import (adapter_ip, apply_wifi_policy, campus_link_state, friendly_error,
                   pppoe_connections, ppp_state, ppp_state_cached, ras_dial, ras_hangup,
-                  wifi_connected_ssid, wifi_profiles, wired_adapters, wired_auth_list,
-                  wired_authenticate, wired_bind_ip)
+                  set_adapter_disabled, wifi_connected_ssid, wifi_profiles, wired_adapters,
+                  wired_auth_list, wired_authenticate, wired_bind_ip)
 from .net import build_prober
 from .rules import kill_processes
 from .util import named_mutex, sleep_interruptible
@@ -97,6 +99,19 @@ def boot_mode():
     # 刚开机时网络栈可能还没就绪，先缓一下
     sleep_interruptible(15, lambda: os.path.isfile(BOOT_STOP))
 
+    # 区分"刚开机"和"计划任务每 5 分钟的重启"：
+    # 开机启动时要清掉上一次留下的「断开」状态 —— 用户的要求是
+    # "开机 / 锁屏界面照样连校园网，只有我主动点断开才保持断开"。
+    try:
+        from .util import system_uptime_seconds
+        if system_uptime_seconds() < 600:
+            if pause_active(pause_file, cfg):
+                clear_pause(cfg)
+                boot_log("本次是开机启动 → 已清除上次留下的「断开」状态，照常连校园网。")
+            clear_disconnect(cfg)
+    except Exception as exc:  # noqa: BLE001
+        boot_log("开机状态判断出错（已忽略）：%s" % exc)
+
     while True:
         if os.path.isfile(BOOT_STOP):
             try:
@@ -120,6 +135,51 @@ def boot_mode():
                 if msg:
                     boot_log(msg)
                 last_wifi = time.time()
+
+            # 处理界面发来的「断开」请求 —— **必须放在循环最前面**。
+            # 为什么：校园网拨号是守护以 SYSTEM 身份建立的，界面（普通用户权限）
+            # 执行 rasdial /disconnect 断不开它，用户看到的就是"点了断开没反应"。
+            # 也正因为是"正在联网"的时候要点断开，所以这段绝不能放在
+            # "在线就 continue" 之后（那正是第一次写错的地方）。
+            if disconnect_requested(cfg):
+                clear_disconnect(cfg)
+                if connection:
+                    code, out = ras_hangup(connection, phonebook)
+                    boot_log("收到「断开」请求 → rasdial 断开 %s（返回码 %s）"
+                             % (connection, code))
+                time.sleep(4)
+                still, ip = ppp_state(connection) if connection else (False, "")
+                if still:
+                    # rasdial 对这种"不属于枚举会话的 PPPoE"无效，只能断它的网卡
+                    adapter = wired_cfg.get("adapter") or ""
+                    if not adapter:
+                        from .net import pick_wired_adapter
+                        adapter = pick_wired_adapter(wired_cfg)
+                    if adapter and set_adapter_disabled(adapter, True):
+                        set_disabled_adapter(adapter, cfg)
+                        boot_log("rasdial 没断掉（链路 %s 仍在）→ 已禁用有线网卡「%s」，"
+                                 "校园网必定断开；手机热点/无线不受影响。"
+                                 "点「立即连接」会自动重新启用它。" % (ip or "?", adapter))
+                    else:
+                        boot_log("断开失败：rasdial 没生效，也没找到可禁用的有线网卡。")
+                else:
+                    boot_log("校园网已断开（%s 已释放）。" % (ip or "IP"))
+                link_cache["t"] = 0
+                link_started = 0.0
+                boot_heartbeat(False, "", "已按请求断开校园网")
+
+            # 「立即连接」后把上次断开时禁用的网卡恢复回来
+            if (not pause_active(pause_file, cfg)) and mode in ("wired", "both"):
+                from .net import adapter_enabled, pick_wired_adapter
+                ad = get_disabled_adapter(cfg) or wired_cfg.get("adapter") \
+                    or pick_wired_adapter(wired_cfg)
+                if ad and not adapter_enabled(ad):
+                    if set_adapter_disabled(ad, False):
+                        clear_disabled_adapter(cfg)
+                        boot_log("检测到有线网卡「%s」被禁用（上次断开留下的）→ 已重新启用。"
+                                 % ad)
+                        time.sleep(6)
+                        link_cache["t"] = 0
 
             link_up, link_desc = campus_link_state(mode, connection, wifi_ssid, link_cache,
                                                    wired_cfg)
