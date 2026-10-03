@@ -6,6 +6,9 @@ __pycache__/
 *$py.class
 *.so
 .Python
+_test_tmp/
+_cna-test-*/
+.ci/
 build/
 develop-eggs/
 dist/
