@@ -1,6 +1,15 @@
 # CampusNetAssistant · 校园网助手
 
-**English:** CampusNetAssistant is a dependency-free Windows utility (pure Python standard library + tkinter) that keeps your campus network (PPPoE dial-up or Wi-Fi) connected, closes the proxy/VPN clients that break campus authentication, and — when you launch a program that needs it — automatically starts your chosen proxy client, picks the fastest working node by real latency testing, and turns on the system proxy. No third-party packages, no telemetry, passwords encrypted with Windows DPAPI.
+[![Release](https://img.shields.io/github/v/release/tanshaojie666/campusnet-assistant?label=release)](https://github.com/tanshaojie666/campusnet-assistant/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+<!-- CI 徽章：把 .github/workflows/ci.yml 推上去之后取消下面这行注释即可
+[![CI](https://github.com/tanshaojie666/campusnet-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/tanshaojie666/campusnet-assistant/actions/workflows/ci.yml)
+-->
+
+**English:** CampusNetAssistant is a dependency-free Windows utility (pure Python standard library + tkinter) that keeps your campus network connected, closes the proxy/VPN clients that break campus authentication, and — when you launch a program that needs it — automatically starts your chosen proxy client, picks the fastest working node by real latency testing, and turns on the system proxy. No third-party packages, no telemetry, passwords encrypted with Windows DPAPI.
 
 ### Quick Start (English)
 
@@ -59,6 +68,7 @@ CampusNetAssistant 把这些串成一条自动化链路：**该连的自动连�
 | --- | --- | --- |
 | 校园网接入方式可选 | 有线 / 无线（连接指定 SSID）/ 两者都要 | 用户选择 |
 | **有线认证方式可选（可多选）** | **PPPoE 拨号**、**自动获取 IP(DHCP)**、**静态 IP**、**Web 门户认证**（深信服/锐捷/Dr.COM，支持自动填表 / 请求模板 / 执行脚本三种方式）、**学校专用客户端**、**有线 802.1X**，还能选择"先重启网卡再认证"。按勾选顺序依次执行 → 详见 [docs/WIRED.md](docs/WIRED.md) | 用户选择 |
+| **无线也能过门户认证** | 网页（门户）认证是**有线无线共用**的一份设置：无线连上 SSID 但上不了网时会自动尝试认证（覆盖"校园 WiFi 连上后弹登录页"这种常见场景） | 用户选择 |
 | 断线自动重拨 | 按设定间隔探测连通性，判定掉线后自动重连；手动断开后进入"先别拨"冷却期，不与你抢 | 开启 |
 | 连上校园网自动关闭代理/VPN | 名单可配置；触发时机为**接入前**先关一遍，**连上之后再检查一遍** | 用户选择 |
 | 无线策略 | 把本机**所有已保存的 Wi-Fi 配置**改成"手动连接"（或直接禁用 WLAN 网卡），防止自动连到别的网络 | 用户选择 |
