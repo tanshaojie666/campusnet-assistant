@@ -164,26 +164,10 @@ def main() -> int:
     else:
         print("仓库已存在，将更新其中的文件：", repo.get("html_url"))
 
+    branch = repo.get("default_branch") or "main"
     ok, fail = 0, []
-    for rel, full in ([] if args.no_files else files):
-        with open(full, "rb") as fh:
-            content = base64.b64encode(fh.read()).decode("ascii")
-        path = "/repos/%s/%s/contents/%s" % (owner, args.repo, rel)
-        sha = None
-        s, info = api(op, token, "GET", path)
-        if s == 200 and isinstance(info, dict):
-            sha = info.get("sha")
-        payload = {"message": args.message, "content": content}
-        if sha:
-            payload["sha"] = sha
-        s, info = api(op, token, "PUT", path, payload)
-        if s in (200, 201):
-            ok += 1
-            print("   ↑ %s" % rel)
-        else:
-            fail.append((rel, s, info))
-            print("   × %s (%s)" % (rel, s))
-
+    if not args.no_files:
+        ok, fail = commit_all(op, token, owner, args.repo, branch, files, args.message)
     if not args.no_files:
         print("\n完成：成功 %d 个，失败 %d 个" % (ok, len(fail)))
         for rel, s, info in fail:
@@ -193,6 +177,80 @@ def main() -> int:
     if args.release:
         publish_release(op, token, owner, args)
     return 0 if not fail else 2
+
+
+def commit_all(op, token, owner, repo, branch, files, message):
+    """把全部文件放进**一个提交**里推上去（Git Data API）。
+
+    以前是用 Contents API 一个文件一个提交：30 个文件 = 30 个提交 = 30 次 CI，
+    仓库历史也很碎。现在改成 blobs → tree → commit → 更新 ref，只有 1 个提交。
+    """
+    def _log(m):
+        print("   " + m)
+
+    s, ref = api(op, token, "GET",
+                 "/repos/%s/%s/git/ref/heads/%s" % (owner, repo, branch))
+    if s != 200:
+        _log("拿不到分支 %s 的指针：%s" % (branch, str(ref)[:120]))
+        return 0, [(branch, s, ref)]
+    head = ref["object"]["sha"]
+    s, commit = api(op, token, "GET", "/repos/%s/%s/git/commits/%s" % (owner, repo, head))
+    base_tree = (commit or {}).get("tree", {}).get("sha")
+    if not base_tree:
+        _log("拿不到基线 tree")
+        return 0, [(branch, s, commit)]
+
+    def build(exclude_workflows=False):
+        items, skipped = [], []
+        for rel, full in files:
+            if exclude_workflows and rel.replace("\\", "/").startswith(".github/workflows/"):
+                skipped.append(rel)
+                continue
+            with open(full, "rb") as fh:
+                content = base64.b64encode(fh.read()).decode("ascii")
+            s2, blob = api(op, token, "POST", "/repos/%s/%s/git/blobs" % (owner, repo),
+                           {"content": content, "encoding": "base64"})
+            if s2 not in (200, 201):
+                skipped.append(rel)
+                continue
+            items.append({"path": rel.replace("\\", "/"), "mode": "100644",
+                          "type": "blob", "sha": blob["sha"]})
+        return items, skipped
+
+    def push(items):
+        s2, tree = api(op, token, "POST", "/repos/%s/%s/git/trees" % (owner, repo),
+                       {"base_tree": base_tree, "tree": items})
+        if s2 not in (200, 201):
+            return s2, tree, None, None
+        s3, newc = api(op, token, "POST", "/repos/%s/%s/git/commits" % (owner, repo),
+                       {"message": message, "tree": tree["sha"], "parents": [head]})
+        if s3 not in (200, 201):
+            return s3, newc, None, None
+        s4, res = api(op, token, "PATCH",
+                      "/repos/%s/%s/git/refs/heads/%s" % (owner, repo, branch),
+                      {"sha": newc["sha"], "force": False})
+        return s4, res, newc, tree
+
+    items, skipped = build()
+    _log("已生成 %d 个文件对象，准备提交 …" % len(items))
+    status, info, newc, tree = push(items)
+    if status not in (200, 201) and any(
+            rel.replace("\\", "/").startswith(".github/workflows/") for rel, _f in files):
+        # 多半是 token 没有 workflow 权限（GitHub 对 workflow 目录单独校验）。
+        # 去掉这些文件重试 —— 它们通常已经在仓库里了，不需要每次重传。
+        _log("整批提交失败（%s），去掉 .github/workflows/ 后重试 …" % status)
+        items2, skipped2 = build(exclude_workflows=True)
+        status, info, newc, tree = push(items2)
+        skipped += skipped2
+        items = items2
+    if status not in (200, 201):
+        _log("提交失败（%s）：%s" % (status, str(info)[:200]))
+        return 0, [(branch, status, info)]
+
+    if skipped:
+        _log("跳过的文件：%s（多半是权限或不存在）" % "、".join(skipped[:5]))
+    _log("√ 已提交 %d 个文件（单个提交 %s）" % (len(items), (newc or {}).get("sha", "")[:8]))
+    return len(items), []
 
 
 def extract_notes(root: str, tag: str) -> str:
