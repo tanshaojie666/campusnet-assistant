@@ -16,14 +16,15 @@ from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
                      boot_heartbeat, boot_log, heartbeat_state, load_boot_config,
                      load_rules, pause_active)
 from .clients import scan_clients
-from .net import (apply_wifi_policy, campus_link_state, friendly_error, pppoe_connections,
-                  ppp_state, ppp_state_cached, ras_dial, ras_hangup,
-                  wifi_connected_ssid, wifi_profiles)
+from .net import (adapter_ip, apply_wifi_policy, campus_link_state, friendly_error,
+                  pppoe_connections, ppp_state, ppp_state_cached, ras_dial, ras_hangup,
+                  wifi_connected_ssid, wifi_profiles, wired_adapters, wired_auth_list,
+                  wired_authenticate)
 from .net import build_prober
 from .rules import kill_processes
 from .util import named_mutex, sleep_interruptible
 
-MODE_LABEL = {"wired": "有线拨号", "wireless": "无线", "both": "有线+无线"}
+MODE_LABEL = {"wired": "有线", "wireless": "无线", "both": "有线+无线"}
 
 
 def _script_mtime():
@@ -56,7 +57,19 @@ def boot_mode():
     interval = max(5, int(cfg.get("interval") or 15))
     if not cfg.get("mode"):
         boot_log("提示：系统级配置仍是旧版格式（只有 connection/username），"
-                 "接入方式按“有线”处理；重新运行 --install-boot 可写入新格式。")
+                 "接入方式按“有线拨号”处理；重新运行 --install-boot 可写入新格式。")
+
+    # 有线接入配置（PPPoE 之外的 DHCP / 静态 IP / 门户认证 / 学校客户端 / 802.1X）
+    wired_cfg = dict(cfg.get("wired") or {})
+    portal_cfg = dict(wired_cfg.get("portal") or {})
+    portal_user = portal_cfg.get("username") or account
+    portal_pwd = dpapi_decrypt(portal_cfg.get("password_machine") or "", machine=True) \
+        if portal_cfg.get("password_machine") else password
+    if portal_pwd:
+        portal_cfg["_password"] = portal_pwd        # 只放内存，不写回文件
+    wires = wired_auth_list(wired_cfg, connection)
+    if not wired_cfg.get("auth"):
+        wired_cfg["auth"] = wires
 
     prober = build_prober(cfg, connection)
     link_cache = {}
@@ -64,10 +77,11 @@ def boot_mode():
     last_wifi = 0.0
     mtime = _script_mtime()
 
-    boot_log("===== 系统级守护启动：接入方式=%s 拨号连接=%s 无线=%s =====" %
-             (MODE_LABEL.get(mode, mode), connection or "(未配置)", wifi_ssid or "(未配置)"))
+    boot_log("===== 系统级守护启动：接入方式=%s 拨号连接=%s 有线方式=%s 无线=%s =====" %
+             (MODE_LABEL.get(mode, mode), connection or "(未配置)",
+              "+".join(wires), wifi_ssid or "(未配置)"))
     boot_heartbeat(False, "", "启动中")
-    if mode in ("wired", "both") and not password:
+    if mode in ("wired", "both") and not password and ("pppoe" in wires):
         boot_log("警告：读不到拨号密码（机器范围加密失败），只能用系统记住的凭据。")
 
     # 刚开机时网络栈可能还没就绪，先缓一下
@@ -97,7 +111,8 @@ def boot_mode():
                     boot_log(msg)
                 last_wifi = time.time()
 
-            link_up, link_desc = campus_link_state(mode, connection, wifi_ssid, link_cache)
+            link_up, link_desc = campus_link_state(mode, connection, wifi_ssid, link_cache,
+                                                   wired_cfg)
 
             # 校园网一连上，就关掉代理/VPN（链路级判断，代理软件没法伪造）
             if kill_on and link_up:
@@ -107,10 +122,11 @@ def boot_mode():
                     link_cache["t"] = 0
 
             ppp_up, ppp_ip = (False, "")
-            if mode in ("wired", "both") and connection:
+            if mode in ("wired", "both") and connection and "pppoe" in wires:
                 ppp_up, ppp_ip = ppp_state_cached(connection, link_cache)
+            bind_ip = ppp_ip or (wired_bind_ip(wired_cfg) if mode == "wired" else "")
 
-            ok, ip, why = prober.check(bind_ip=ppp_ip or None)
+            ok, ip, why = prober.check(bind_ip=bind_ip or None)
             if os.environ.get("CNA_TEST_OFFLINE"):
                 ok = False                              # 仅自测用：假装掉线
             boot_heartbeat(ok, ip, why, campus=link_desc)
@@ -139,7 +155,8 @@ def boot_mode():
                     wifi_connect(wifi_ssid)
                     time.sleep(8)
 
-            if mode in ("wired", "both") and connection:
+            use_pppoe = ("pppoe" in wires) and bool(connection)
+            if mode in ("wired", "both") and use_pppoe:
                 boot_log("检测到掉线，开始拨号…")
                 if kill_on:
                     acted, detail = kill_processes(processes)
@@ -164,6 +181,32 @@ def boot_mode():
                     sleep_interruptible(backoff, lambda: os.path.isfile(BOOT_STOP))
                     backoff = min(backoff * 2, 300)
                     continue
+            elif mode in ("wired", "both") and any(
+                    a in wires for a in ("dhcp", "static", "portal", "client", "lan", "restart")):
+                # DHCP / 静态 IP / 门户认证 / 学校客户端 / 802.1X
+                boot_log("检测到掉线，按配置接入有线（%s）…" % "+".join(wires))
+                if kill_on:
+                    acted, detail = kill_processes(processes)
+                    if acted:
+                        boot_log("接入前先关闭了代理/VPN：" + detail)
+                        sleep_interruptible(3)
+                pc = dict(portal_cfg)
+                if pc.pop("_password", None):
+                    pass
+                wired_authenticate(wired_cfg, connection, portal_user,
+                                   portal_cfg.get("_password") or password, boot_log)
+                time.sleep(5)
+                link_cache["t"] = 0
+                ok2, ip2, why2 = prober.check(bind_ip=wired_bind_ip(wired_cfg) or None)
+                boot_heartbeat(ok2, ip2, why2)
+                if ok2:
+                    boot_log("有线接入成功，已联网（IP %s）" % (ip2 or "?"))
+                    fails, backoff = 0, interval
+                else:
+                    boot_log("有线接入动作已执行，但还没联网；%d 秒后重试" % backoff)
+                    sleep_interruptible(backoff, lambda: os.path.isfile(BOOT_STOP))
+                    backoff = min(backoff * 2, 300)
+                    continue
             elif mode == "wireless":
                 boot_log("无线未连上（%s），%d 秒后重试" % (link_desc or "原因未知", backoff))
                 sleep_interruptible(backoff, lambda: os.path.isfile(BOOT_STOP))
@@ -181,26 +224,54 @@ def boot_mode():
 # --------------------------------------------------------------------------
 def selftest(cfg) -> int:
     from .config import heartbeat_state, rules_path
-    from .net import pppoe_connections, ppp_state, wifi_connected_ssid, wifi_profiles
+    from .net import (pick_wired_adapter, pppoe_connections, ppp_state, wifi_connected_ssid,
+                      wifi_profiles, wired_adapters, wired_auth_list, wired_link_state)
     from .util import is_admin
 
     line = "-" * 60
     campus = cfg.get("campus") or {}
+    wired_cfg = campus.get("wired") or {}
+    auths = wired_auth_list(wired_cfg, campus.get("connection") or "")
+    AUTH_LABEL = {"pppoe": "PPPoE 拨号", "dhcp": "自动获取 IP", "static": "静态 IP",
+                  "portal": "Web 门户认证", "client": "学校客户端", "lan": "802.1X",
+                  "restart": "先重启网卡"}
     print(line)
     print("1) 校园网接入")
     print("   接入方式：", MODE_LABEL.get(campus.get("mode"), campus.get("mode")))
-    print("   找到的 PPPoE 连接：", pppoe_connections() or "（没找到）")
-    print("   当前使用：", campus.get("connection") or "（未配置）")
-    up, ip = ppp_state(campus.get("connection") or "")
-    print("   PPPoE 状态：", ("已连接 %s" % ip) if up else "未连接")
+    print("   有线认证：", " → ".join(AUTH_LABEL.get(a, a) for a in auths))
+    print("   有线网卡：", wired_cfg.get("adapter") or
+          ("（自动：%s）" % (pick_wired_adapter(wired_cfg) or "没找到")))
+    print("   可用有线网卡：", [a[0] for a in wired_adapters()] or "（没找到）")
+    up0, desc0 = wired_link_state(wired_cfg, campus.get("connection") or "")
+    print("   有线链路：", "已连上 - " + desc0 if up0 else desc0)
+    if "pppoe" in auths:
+        print("   找到的 PPPoE 连接：", pppoe_connections() or "（没找到）")
+        print("   当前使用：", campus.get("connection") or "（未配置）")
+    if "static" in auths:
+        st = wired_cfg.get("static") or {}
+        print("   静态 IP：", st.get("address") or "（未填）", "网关",
+              st.get("gateway") or "-", "DNS", st.get("dns") or "-")
+    if "portal" in auths:
+        p = wired_cfg.get("portal") or {}
+        print("   门户认证：方式=%s 地址=%s 账号=%s" % (
+            p.get("mode") or "auto", p.get("url") or "(自动获取)",
+            p.get("username") or campus.get("account") or "(未填)"))
+    if "client" in auths:
+        print("   学校客户端：", wired_cfg.get("client_exe") or "（未配置）")
+    if "lan" in auths:
+        print("   802.1X 配置名：", wired_cfg.get("lan_profile") or "（未配置）")
     print("   无线 SSID 配置：", campus.get("wifi_ssid") or "（未配置）")
     print("   当前无线：", wifi_connected_ssid() or "未连接")
     print("   已保存无线配置：", len(wifi_profiles()), "个")
     print(line)
     print("2) 密码")
-    from .config import get_password
-    print("   有线账号：", campus.get("account") or "（未配置）")
-    print("   密码能否解开：", "能" if get_password(cfg) else "不能/未配置")
+    from .config import get_password, portal_credentials
+    pu, pp = portal_credentials(cfg)
+    print("   账号：", campus.get("account") or "（未配置）")
+    print("   拨号/认证密码能否解开：", "能" if get_password(cfg) else "不能/未配置")
+    if "portal" in auths:
+        print("   门户账号：", pu or "（未配置）", "| 门户密码：",
+              "能" if pp else ("沿用上面的密码" if get_password(cfg) else "未配置"))
     print(line)
     print("3) 翻墙客户端")
     for c, ok, detail in scan_clients(cfg):
