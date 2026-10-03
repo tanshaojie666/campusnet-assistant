@@ -91,6 +91,19 @@ DEFAULT_CONFIG = {
         "password_enc": "",
         "interval": 15,
         "probes": [],                    # 探测目标 [[host, port], ...]，留空自动用 PPP 的 DNS
+        # Web 门户认证（有线、无线共用；很多学校的 Wi-Fi 连上后也要过网页认证）
+        "portal": {
+            "mode": "auto",              # auto=自动填表 / template=按模板提交 / script=跑命令
+            "url": "",                   # 门户地址（留空自动从跳转里取）
+            "method": "post",            # post / get
+            "body": "",                  # 提交内容模板，支持 {username}/{password}
+            "headers": {},               # 自定义请求头
+            "probe_url": "",             # 判断是否已放行的地址（留空用内置的）
+            "script": "",                # mode=script 时执行的命令
+            "username": "",              # 门户账号（留空用校园网账号）
+            "password_enc": "",          # 门户密码（留空用校园网密码）
+            "preset": "",                # 上次选的厂商预设（仅界面用，便于回显）
+        },
         # 有线接入方式：可多选，按这个顺序执行
         #   pppoe   PPPoE 拨号（宿舍网口最常见）
         #   dhcp    自动获取 IP（插上网线就有 IP）
@@ -241,10 +254,26 @@ def save_boot_config(data):
     return True
 
 
-def portal_credentials(cfg):
-    """门户认证用的账号密码；没单独配就沿用拨号账号。"""
+def campus_portal(cfg):
+    """取门户认证配置（有线无线共用的那一份）。
+
+    兼容早期版本：那时门户设置存在 campus.wired.portal 里，
+    如果新的 campus.portal 是空的、而旧位置有内容，就沿用旧位置。
+    """
     campus = cfg.get("campus") or {}
-    portal = (campus.get("wired") or {}).get("portal") or {}
+    new = dict(campus.get("portal") or {})
+    old = dict((campus.get("wired") or {}).get("portal") or {})
+    if not any(new.get(k) for k in ("url", "script", "username", "password_enc", "body")):
+        merged = dict(new)
+        merged.update({k: v for k, v in old.items() if v})
+        return merged
+    return new
+
+
+def portal_credentials(cfg):
+    """门户认证用的账号密码；没单独配就沿用校园网账号。"""
+    campus = cfg.get("campus") or {}
+    portal = campus_portal(cfg)
     user = portal.get("username") or campus.get("account") or ""
     enc = portal.get("password_enc") or campus.get("password_enc") or ""
     return user, (dpapi_decrypt(enc) if enc else "")
@@ -255,7 +284,7 @@ def build_boot_config(cfg) -> dict:
     campus = cfg.get("campus") or {}
     guard = cfg.get("guard") or {}
     wired = dict(campus.get("wired") or {})
-    portal = dict(wired.get("portal") or {})
+    portal = dict(campus_portal(cfg))
     p_user, p_pwd = portal_credentials(cfg)
     portal["username"] = p_user
     portal.pop("password_enc", None)                  # 系统级配置里不带用户范围密文
@@ -268,6 +297,7 @@ def build_boot_config(cfg) -> dict:
         "account": campus.get("account", ""),
         "password_machine": dpapi_encrypt(get_password(cfg), machine=True),
         "wired": wired,
+        "portal": portal,
         "interval": int(campus.get("interval") or 15),
         "probes": campus.get("probes") or [],
         "kill_proxies": bool(guard.get("kill_proxies", True)),
