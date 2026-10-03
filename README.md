@@ -69,9 +69,12 @@ CampusNetAssistant 把这些串成一条自动化链路：**该连的自动连�
 | 系统托盘 | 点关闭按钮 = 隐藏到托盘（纯 `ctypes` 实现，无第三方库），双击托盘图标恢复窗口 | 开启 |
 | 开机自启 | 登录后自动打开界面/进入守护 | 用户选择 |
 | 环境自检与扫描 | `--selftest` 排查环境问题（网卡、认证方式、链路状态、客户端、守护）；`--scan` 扫描本机 PPPoE 连接、无线配置、已装代理客户端 | 命令行 |
+| 门户认证厂商预设 | 界面里直接选「深信服 / 锐捷 / Dr.COM / H3C」，自动填好常见请求地址与字段名；另有「测试门户认证」按钮，不用等掉线就能试一次 | 内置 |
+| 配置导出 / 导入 | 一键把设置导出成 JSON，换电脑或分享给同学（密码是本机账户加密的密文，换机需重填） | 界面按钮 |
+| 单元测试与 CI | 29 个单元测试（模板替换 / 登录页解析 / 认证方式推断 / 配置合并 / 地区匹配 / 电话簿解析 / 规则兼容…），不联网、不改系统设置；GitHub Actions 每次提交自动跑 | 开发用 |
 
 > 所有功能都在本机完成，不依赖任何服务器，也不上传任何数据。
-> **有线接入方式的完整说明（怎么判断自己是哪种、门户认证怎么抓请求、厂商字段参考、排查清单）见 [docs/WIRED.md](docs/WIRED.md)。**
+> **有线接入方式的完整说明（怎么判断自己是哪种、门户认证怎么抓请求、厂商字段参考、排查清单）见 [docs/WIRED.md](docs/WIRED.md)；版本变化见 [CHANGELOG.md](CHANGELOG.md)。**
 
 ## 界面说明
 
@@ -130,18 +133,28 @@ CampusNetAssistant 把这些串成一条自动化链路：**该连的自动连�
 
 ## 安装与快速开始
 
-### 方式一：下载压缩包（推荐给不熟悉命令行的人）
+### 方式零：下载免安装版（**不想装 Python 就用这个**）
+
+到 [**Releases 页面**](../../releases/latest) 下载 `校园网助手-免安装版.zip`（约 18 MB），
+解压后双击 **`① 启动校园网助手.cmd`** 即可使用 —— **包里自带精简版 Python，无需安装任何东西**。
+包内附 `先看我-怎么用.txt`，同学/同事照着做两分钟就能配好。
+
+> 免安装版只在本机运行，不联网安装依赖；解压到任意目录都行（路径含中文也没问题）。
+
+### 方式一：下载源码压缩包（适合已装 Python 的人）
 
 1. 在 GitHub 仓库页面点 **Code → Download ZIP**，解压到一个**路径不含中文**的目录，例如 `D:\CampusNetAssistant`。
-2. 确认已安装 Python 3.8+。打开"命令提示符"输入 `python --version`，能打印版本即可。
+2. 确认已安装 Python 3.9+。打开"命令提示符"输入 `python --version`，能打印版本即可。
 3. 双击目录里的 **`CampusNetAssistant.pyw`**（`.pyw` 双击不会弹出黑色命令行窗口）。
 4. 在界面里完成首次配置：
    - 选接入方式（有线 / 无线 / 两者）；
-   - 有线：下拉框选你的拨号连接（不知道叫啥就先点 `--scan`，见下），填账号密码；
-   - 无线：填 SSID；
+   - **有线**：在下拉框选你的拨号连接，并**勾选有线认证方式**（PPPoE 拨号 / 自动获取 IP /
+     静态 IP / Web 门户认证 / 学校客户端 / 802.1X，可多选；不确定就同时勾 PPPoE 和 DHCP）；
+     详解见 [docs/WIRED.md](docs/WIRED.md)；
+   - **无线**：填 SSID；
    - 勾上"连上校园网就关闭代理/VPN"，并在名单里加上你常用的代理客户端；
-   - 点 **保存设置**。
-5. 点 **立即连接** 验证能上；上不去就用命令行跑一次自检（见下）。
+   - 点 **保存设置**（也可以点「导出设置…」把配置存成文件，换电脑时「导入设置…」）。
+5. 点 **立即连接** 验证能上；上不去就双击 `② 自检` 或用命令行跑一次自检（见下）。
 
 ### 方式二：命令行 / git
 
@@ -152,11 +165,22 @@ python -m campusnet            :: 打开图形界面
 python -m campusnet --scan     :: 先看一眼本机有啥连接、啥无线网、装了什么代理客户端
 ```
 
+### 方式三：自己打包免安装版（分发给同学）
+
+把本机 Python 的精简副本和项目放一起即可：
+
+```bat
+robocopy C:\Python3xx .\python /E /XD Doc Lib\test Lib\idlelib Lib\ensurepip Lib\site-packages
+```
+
+再写一个 `启动.cmd` 调用 `python\pythonw.exe CampusNetAssistant.pyw`（注意 `.cmd` 内容保持纯 ASCII）。
+本项目的 Releases 附件就是这么打出来的。
+
 ### 第一次使用建议跑这两条
 
 ```bat
 python -m campusnet --scan        :: 本机有什么：PPPoE 连接名、已保存的 Wi-Fi、已装的代理客户端
-python -m campusnet --selftest    :: 环境自检：tkinter、权限、拨号组件、无线服务、控制端口、计划任务
+python -m campusnet --selftest    :: 环境自检：网卡、认证方式、链路状态、代理客户端、系统级守护
 ```
 
 ### 让它在开机 / 锁屏时也工作
@@ -491,16 +515,37 @@ CampusNetAssistant/
 ├─ CampusNetAssistant.pyw     双击启动（无控制台窗口）
 ├─ campusnet/                主程序包（python -m campusnet）
 │  ├─ __main__.py            命令行入口：--selftest / --scan / --boot / --install-boot ...
-│  ├─ ...
+│  ├─ config.py              配置、默认值、DPAPI 加密、系统级配置构建
+│  ├─ net.py                 网络与校园网接入（PPPoE / DHCP / 静态IP / 门户 / 802.1X）
+│  ├─ clients.py             翻墙客户端适配器（mihomo/Clash 控制接口）
+│  ├─ rules.py               关代理/VPN、翻墙触发判断
+│  ├─ guard.py               系统级守护（SYSTEM 常驻）+ 自检/扫描
+│  ├─ installer.py           计划任务安装/卸载
+│  ├─ gui.py                 图形界面（tkinter）
+│  └─ util.py                进程/DPAPI/netstat/托盘图标等系统工具
+├─ tests/
+│  └─ test_core.py           29 个单元测试（不联网、不改系统设置）
+├─ .github/workflows/ci.yml  CI：语法检查 + 单元测试（Windows / Python 3.9 & 3.12）
 ├─ scripts/
-│  └─ publish_github.py      半自动发布脚本（见 PUBLISH.md）
+│  ├─ install-boot.cmd       安装系统级守护（自动提权）
+│  ├─ uninstall-boot.cmd     卸载
+│  └─ publish_github.py      半自动发布脚本（见 PUBLISH.md，支持 --release 发版）
 ├─ docs/
-│  ├─ CLIENTS.md             如何添加翻墙客户端（重点看这个）
+│  ├─ WIRED.md               有线接入方式详解（重点看这个）
+│  ├─ CLIENTS.md             如何添加翻墙客户端
 │  └─ images/                界面截图（占位）
 ├─ README.md
+├─ CHANGELOG.md
 ├─ PUBLISH.md
 ├─ LICENSE
 └─ .gitignore
+```
+
+### 开发与测试
+
+```bat
+python -m unittest discover -s tests -v      :: 跑单元测试
+python -m compileall -q campusnet            :: 语法检查
 ```
 
 ## 贡献指南
@@ -508,8 +553,9 @@ CampusNetAssistant/
 欢迎 PR，尤其是下面这几类"别人替不了你"的补充：
 
 - **新的客户端适配器**：把你正在用的 mihomo/Clash 系客户端定义整理成一条 `clients[]` 配置（或直接改内置清单），并附上**你是怎么找到控制端口的**。请参考 [`docs/CLIENTS.md`](docs/CLIENTS.md)。
-- **校园网适配经验**：你学校的接入方式（PPPoE 参数、门户认证流程、是否封 ICMP、多设备限制），写进文档或作为兼容性代码。
+- **校园网适配经验**：你学校的接入方式（PPPoE 参数、门户认证流程、是否封 ICMP、多设备限制），写进文档或作为兼容性代码。有线门户认证的厂商字段参考见 [`docs/WIRED.md`](docs/WIRED.md)。
 - **错误码补充**：`rasdial` / `netsh wlan` 的其它报错及人话解释。
+- **测试**：新加的纯逻辑函数请顺手补一个 `tests/test_core.py` 里的用例。
 - **文档改进**：错别字、说反了的地方、你踩过的坑。
 
 提 PR 前请确认：
