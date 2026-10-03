@@ -1,89 +1,188 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""静态自查：找出"用了但没定义/没导入"的名字。
+"""静态自查：找出"用了，但在当前作用域里没定义/没导入"的名字。
 
-为什么需要它：`python -m py_compile` 只检查语法，抓不到
-`name 'xxx' is not defined` 这类运行时才爆的错。本项目就踩过一次
-（守护循环里用了 wired_bind_ip 但忘了 import，结果每轮都抛异常、
-自动拨号和关代理静默失效）。这个脚本用 AST 做一次轻量检查，
-不需要任何第三方依赖。
+为什么需要它：`py_compile` 只检查语法，抓不到 `name 'xxx' is not defined`。
+本项目踩过两次，两次都是**静默失效**：
+  1. 守护循环里用了 `wired_bind_ip` 却忘了 import → 每轮抛异常，自动拨号静默失效；
+  2. `gui.py` 的 `_flip_watch` 里用了 `pause_active`，而它只在**兄弟函数**
+     `_watchdog` 内部 import 过 → 翻墙模式每 5 秒崩一次，整个功能失效。
+
+旧版检查器只做"模块级粗查"（名字在文件里出现过就算数），
+兄弟函数的局部导入正好骗过它 —— 所以第 2 个 bug 溜到了线上。
+现在做**真正的作用域分析**：只认"自己这一层 + 外层"绑定的名字，
+兄弟作用域里的局部变量/局部导入**不算**。
 
 用法：
-    python scripts/check_names.py          # 检查 campusnet/ 与 tests/
-    python scripts/check_names.py <目录>
+    python scripts/check_names.py            # 检查 campusnet/ tests/ scripts/
+    python scripts/check_names.py <目录或文件>
 
 局限（有意为之，避免误报）：
-  · 只做"模块级可见名字"的粗粒度判断，不分析作用域细节；
-  · 对 getattr/globals()/exec 之类动态取名字的地方一律放行；
-  · 因此它**只报几乎可以确定的错误**，不追求覆盖全部未定义名字。
+  · 不做类型推断，只做名字解析；
+  · 文件里以**字符串字面量**出现过的名字一律放行（可能是 getattr/globals 注入）；
+  · 出现 `import *` 的文件整体跳过（无法知道导入了什么）。
 """
 from __future__ import annotations
 
 import ast
 import builtins
 import os
+import re
 import sys
 
-BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__", "__package__",
-                                 "__spec__", "__loader__", "__builtins__", "self", "cls"}
+BUILTINS = set(dir(builtins)) | {
+    "__file__", "__name__", "__doc__", "__package__", "__spec__", "__loader__",
+    "__builtins__", "__class__", "__debug__", "self", "cls", "super",
+}
+NESTED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
-def module_bound_names(tree, path):
-    """收集模块里"能被引用到"的名字：导入、赋值、def/class、for 目标、with as 等。"""
+def _params(fn):
+    a = fn.args
+    out = set()
+    for arg in (list(getattr(a, "posonlyargs", [])) + list(a.args) + list(a.kwonlyargs)):
+        out.add(arg.arg)
+    if a.vararg:
+        out.add(a.vararg.arg)
+    if a.kwarg:
+        out.add(a.kwarg.arg)
+    return out
+
+
+def _bound(node):
+    """收集"这一层作用域自己绑定"的名字（不下钻嵌套作用域、不下钻推导式）。"""
     names = set()
 
-    class Collect(ast.NodeVisitor):
-        def visit_Import(self, node):
-            for a in node.names:
-                names.add((a.asname or a.name.split(".")[0]))
+    def walk(b):
+        for ch in ast.iter_child_nodes(b):
+            if isinstance(ch, NESTED):
+                names.add(getattr(ch, "name", None) or "<lambda>")
+                continue                      # 它的局部名字属于它自己
+            if isinstance(ch, COMPS):
+                continue
+            if isinstance(ch, ast.Import):
+                for a in ch.names:
+                    names.add(a.asname or a.name.split(".")[0])
+                continue
+            if isinstance(ch, ast.ImportFrom):
+                for a in ch.names:
+                    names.add("*" if a.name == "*" else (a.asname or a.name))
+                continue
+            if isinstance(ch, ast.Name) and isinstance(ch.ctx, (ast.Store, ast.Del)):
+                names.add(ch.id)
+            elif isinstance(ch, ast.ExceptHandler) and ch.name:
+                names.add(ch.name)
+            elif isinstance(ch, ast.MatchAs) and ch.name:
+                names.add(ch.name)
+            elif isinstance(ch, ast.MatchStar) and ch.name:
+                names.add(ch.name)
+            elif isinstance(ch, ast.MatchMapping) and ch.rest:
+                names.add(ch.rest)
+            elif isinstance(ch, ast.arg):
+                names.add(ch.arg)
+            walk(ch)
 
-        def visit_ImportFrom(self, node):
-            for a in node.names:
-                if a.name != "*":
-                    names.add(a.asname or a.name)
-
-        def visit_FunctionDef(self, node):
-            names.add(node.name)
-            for arg in list(node.args.args) + list(node.args.kwonlyargs):
-                names.add(arg.arg)
-            if node.args.vararg:
-                names.add(node.args.vararg.arg)
-            if node.args.kwarg:
-                names.add(node.args.kwarg.arg)
-            self.generic_visit(node)
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Lambda(self, node):
-            for arg in list(node.args.args) + list(node.args.kwonlyargs):
-                names.add(arg.arg)
-            self.generic_visit(node)
-
-        def visit_ClassDef(self, node):
-            names.add(node.name)
-            self.generic_visit(node)
-
-        def visit_Name(self, node):
-            if isinstance(node.ctx, (ast.Store, ast.Del)):
-                names.add(node.id)
-            self.generic_visit(node)
-
-        def visit_ExceptHandler(self, node):
-            if node.name:
-                names.add(node.name)
-            self.generic_visit(node)
-
-        def visit_Global(self, node):
-            names.update(node.names)
-
-        def visit_Nonlocal(self, node):
-            names.update(node.names)
-
-        def visit_comprehension(self, node):
-            self.generic_visit(node)
-
-    Collect().visit(tree)
+    walk(node)
     return names
+
+
+class Checker:
+    def __init__(self, path, src):
+        self.path = path
+        self.out = []
+        # 文件里作为字符串出现过的名字放松检查（getattr/globals/setattr 注入）
+        self.relax = set(re.findall(r"""["']([A-Za-z_][A-Za-z0-9_]*)["']""", src))
+        self.skipped = "import *" in src
+
+    # ---------------------------------------------------------------- 主流程
+    def run(self, tree):
+        if self.skipped:
+            return []
+        module_names = _bound(tree)
+        for stmt in tree.body:
+            self.scan(stmt, [module_names | BUILTINS])
+        return self.out
+
+    # ---------------------------------------------------------------- 作用域
+    def scan(self, node, chain):
+        """在 chain（由外到内的可见名字集合）里扫这个节点的 Load 名字。"""
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                self.check(node, chain)
+            return
+        if isinstance(node, (ast.Lambda,)):
+            for stmt in (node.body,):
+                self.scan(stmt, chain + [_params(node)])
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.handle_func(node, chain)
+            return
+        if isinstance(node, ast.ClassDef):
+            for e in list(node.bases) + list(node.decorator_list) + \
+                    [k.value for k in node.keywords]:
+                self.scan(e, chain)
+            self.scan_body(node.body, chain + [_bound(node)])
+            return
+        if isinstance(node, COMPS):
+            inner = set()
+            for gen in node.generators:
+                for ch in ast.walk(gen.target):
+                    if isinstance(ch, ast.Name):
+                        inner.add(ch.id)
+            new_chain = chain + [inner]
+            for i, gen in enumerate(node.generators):
+                # 第一个 for 后面的可迭代对象在**外层**求值
+                self.scan(gen.iter, chain if i == 0 else new_chain)
+                for cond in gen.ifs:
+                    self.scan(cond, new_chain)
+            if isinstance(node, ast.DictComp):
+                self.scan(node.key, new_chain)
+                self.scan(node.value, new_chain)
+            else:
+                self.scan(node.elt, new_chain)
+            return
+        if isinstance(node, ast.arguments):
+            # 默认值属于**外层**作用域；参数名属于内层（由 handle_func 提供）
+            for e in list(node.defaults) + [x for x in node.kw_defaults if x]:
+                self.scan(e, chain)
+            for arg in [node.vararg, node.kwarg] + list(node.args) + list(node.kwonlyargs) + \
+                    list(getattr(node, "posonlyargs", [])):
+                if arg is not None and arg.annotation is not None:
+                    self.scan(arg.annotation, chain)
+            return
+        for ch in ast.iter_child_nodes(node):
+            self.scan(ch, chain)
+
+    def handle_func(self, fn, chain):
+        for e in fn.decorator_list:
+            self.scan(e, chain)
+        for e in list(fn.args.defaults) + [x for x in fn.args.kw_defaults if x]:
+            self.scan(e, chain)
+        for arg in [fn.args.vararg, fn.args.kwarg] + list(fn.args.args) + \
+                list(fn.args.kwonlyargs) + list(getattr(fn.args, "posonlyargs", [])):
+            if arg is not None and arg.annotation is not None:
+                self.scan(arg.annotation, chain)
+        ret = getattr(fn, "returns", None)
+        if ret is not None:
+            self.scan(ret, chain)
+        self.scan_body(fn.body, chain + [_params(fn) | _bound(fn)])
+
+    def scan_body(self, body, chain):
+        for stmt in body:
+            self.scan(stmt, chain)
+
+    def check(self, node, chain):
+        name = node.id
+        if name in self.relax:
+            return
+        for scope in chain:
+            if name in scope:
+                return
+        if name in BUILTINS:
+            return
+        self.out.append("%s:%d 疑似未定义的名字: %s"
+                        % (self.path, node.lineno, name))
 
 
 def check_file(path):
@@ -93,22 +192,7 @@ def check_file(path):
         tree = ast.parse(src, path)
     except SyntaxError as exc:
         return ["%s:%s 语法错误: %s" % (path, exc.lineno, exc.msg)]
-
-    bound = module_bound_names(tree, path) | BUILTINS
-
-    # 动态取名字的地方一律放行，避免误报
-    if "getattr(" in src or "globals()" in src or "exec(" in src or "eval(" in src:
-        dynamic = True
-    else:
-        dynamic = False
-
-    problems = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-            if node.id in bound:
-                continue
-            problems.append("%s:%d 疑似未定义的名字: %s" % (path, node.lineno, node.id))
-    return problems
+    return Checker(path, src).run(tree)
 
 
 def main(argv):

@@ -708,6 +708,76 @@ class TestHotspotAutoConnect(unittest.TestCase):
         self.assertFalse(C.load_rules(None)["hotspot_preconnect"])
         C.save_rules({"flip": {}, "hotspot_preconnect": True})
 
+    # ------------------------------------------------------------ 回归：静态自查
+    def test_check_names_is_scope_aware(self):
+        """静态自查必须区分**作用域**：兄弟函数里的局部 import 不算数。
+
+        真实事故：`gui.py` 的 `_flip_watch` 用了 `pause_active`，
+        而它只在兄弟函数 `_watchdog` 内部 import 过 → 翻墙模式每 5 秒
+        抛一次 NameError，整个功能静默失效。旧版检查器"名字在文件里出现过
+        就算数"，正好放过了它。这里锁住"必须报出来"。
+        """
+        import ast
+        import importlib.util
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        spec = importlib.util.spec_from_file_location(
+            "cna_check_names", os.path.join(root, "scripts", "check_names.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        bad = ("import os\n"
+               "def a():\n"
+               "    from x import y\n"
+               "    return y()\n"
+               "def b():\n"
+               "    return y()\n")          # ← 这里 y 不存在，必须报
+        problems = mod.Checker("t.py", bad).run(ast.parse(bad))
+        self.assertTrue(problems, "兄弟作用域里的局部导入不该被当成可见名字")
+        self.assertIn("y", problems[0])
+
+        good = ("import os\n"
+                "from x import y\n"
+                "def a():\n"
+                "    return y()\n")
+        self.assertEqual(mod.Checker("t.py", good).run(ast.parse(good)), [])
+
+    def test_flip_watch_survives_a_round(self):
+        """翻墙模式的后台循环至少要能跑几秒不报错。
+
+        上面那个 NameError 就是这么溜出去的：静态检查没抓到、单元测试也没跑到
+        这条循环。这里真把它跑起来，并断言没有"出错"日志。
+        （把触发规则和热点连接都换成假的，确保测试不碰真实网络。）
+        """
+        import threading
+        import time
+        from unittest import mock
+        try:
+            import tkinter as tk
+        except Exception:
+            self.skipTest("没有 tkinter")
+        from campusnet import gui as G
+
+        root = tk.Tk()
+        root.withdraw()
+        app = None
+        try:
+            app = G.App(root, C.load_config())
+            logs = []
+            app.log = lambda msg, tag="info": logs.append("[%s] %s" % (tag, msg))
+            with mock.patch.object(G, "flip_triggered", return_value=(False, "")), \
+                    mock.patch.object(G.App, "_auto_connect_hotspot", return_value=False):
+                t = threading.Thread(target=app._flip_watch, daemon=True)
+                t.start()
+                time.sleep(3.0)
+                app.stop_event.set()
+                t.join(timeout=5)
+            bad = [x for x in logs if "出错" in x]
+            self.assertEqual(bad, [], "翻墙 watcher 报错了：%s" % bad)
+        finally:
+            if app is not None:
+                app.closing = True
+            root.destroy()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

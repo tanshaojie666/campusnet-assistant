@@ -23,7 +23,7 @@ from . import config as C
 from .clients import client_by_id, client_installed, scan_clients
 from .config import (APP_TITLE, CONFIG_FILE, HOME_DIR, LOG_FILE, clear_disconnect,
                      clear_flip_active, clear_pause, heartbeat_state, load_config,
-                     load_rules, request_disconnect, save_config, save_rules,
+                     load_rules, pause_active, request_disconnect, save_config, save_rules,
                      set_account, set_flip_active, set_pause)
 from .guard import boot_task_registered
 from .installer import install_boot, uninstall_boot
@@ -1526,7 +1526,6 @@ class App:
                             _up, ip = ppp_state(s["connection"])
                             ok, _lip, _why = prober.check(bind_ip=ip or None)
                             if not ok:
-                                from .config import pause_active
                                 if not pause_active():
                                     self.log("检测到掉线，正在自动重拨…", "warn")
                                     ras_hangup(s["connection"])
@@ -1539,7 +1538,6 @@ class App:
                             prober = build_prober(self.cfg["campus"], "")
                             ok, _lip, _why = prober.check(bind_ip=wired_bind_ip(wired_cfg) or None)
                             if not ok:
-                                from .config import pause_active
                                 if not pause_active():
                                     self.log("检测到掉线，按配置重新接入有线…", "warn")
                                     wired_authenticate(wired_cfg, s.get("connection") or "",
@@ -1564,6 +1562,7 @@ class App:
         told_net = 0.0          # "正在试着连热点"这条日志的节流
         alt_until = 0.0         # 等手机热点关联+拿地址的截止时间
         last_pre = 0.0          # 热点预连接的节流
+        err_last, err_last_at = "", 0.0   # 出错日志节流（同一错误不重复刷屏）
         while not self.stop_event.is_set():
             try:
                 rules = load_rules(None)
@@ -1579,10 +1578,10 @@ class App:
                         and time.time() - last_pre > 45):
                     last_pre = time.time()
                     if (wifi_connected_ssid() or "").strip().lower() != _want_hs.lower():
-                        if self._auto_connect_hotspot(timeout=30, quiet=True):
-                            pass
-                        else:
-                            self.log("没填热点名，无法自动连（「校园网」页 → 翻墙时连接）", "warn")
+                        if not self._auto_connect_hotspot(timeout=30, quiet=True):
+                            _ok, _why = hotspot_diagnosis(_want_hs)
+                            self.log("手机热点「%s」现在连不上（%s）"
+                                     "—— 等它出现会自动再试" % (_want_hs, _why), "warn")
 
                 # 维护"翻墙模式在用代理"标记：活着就刷新，死了就撤掉
                 if own_key:
@@ -1701,7 +1700,12 @@ class App:
                                 else:
                                     self.log("没能开出可用代理：可以手动打开客户端连一次再试。", "err")
             except Exception as exc:  # noqa: BLE001
-                self.log("翻墙模式出错（已忽略）：%s" % exc, "err")
+                # 同一个错误只报一次（换错误或过 5 分钟再报），否则一个持续性的
+                # 小问题会每 5 秒刷一行，把日志淹掉、也让人看不出真正的问题。
+                _k = "%s: %s" % (type(exc).__name__, exc)
+                if _k != err_last or time.time() - err_last_at > 300:
+                    err_last, err_last_at = _k, time.time()
+                    self.log("翻墙模式出错（已忽略）：%s" % exc, "err")
             self._sleep(5)
 
     def _sleep(self, seconds):
