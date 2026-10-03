@@ -371,6 +371,97 @@ def pause_active(path=None, cfg=None):
         return False
 
 
+def clear_pause(cfg=None):
+    """取消"先别拨"冷却期（用户点「立即连接」时用）。"""
+    p = (cfg or {}).get("pause_file") or PAUSE_FILE
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
+# --------------------------------------------------------------------------
+# 断开请求
+#
+# 为什么需要它：校园网拨号是**系统级守护以 SYSTEM 身份**建立的，
+# 界面程序（普通用户权限）执行 rasdial /disconnect **断不开它**
+# —— 表现就是"点了断开，链路还在"。
+# 所以界面只能"请求"守护去断：守护有权限，而且它每 15 秒巡检一次。
+# --------------------------------------------------------------------------
+DISCONNECT_FILE = "disconnect.request"
+
+
+def disconnect_path(boot_cfg=None):
+    base = HOME_DIR
+    if boot_cfg and boot_cfg.get("user_rules"):
+        base = os.path.dirname(boot_cfg["user_rules"])
+    return os.path.join(base, DISCONNECT_FILE)
+
+
+def request_disconnect(note=""):
+    """界面调用：请求系统级守护把校园网断开。"""
+    path = disconnect_path(None)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("%.0f\t%s" % (time.time(), note or ""))
+        return True
+    except Exception:
+        return False
+
+
+def disconnect_requested(boot_cfg=None):
+    try:
+        with open(disconnect_path(boot_cfg), "r", encoding="utf-8-sig") as fh:
+            return bool(fh.read().strip())
+    except Exception:
+        return False
+
+
+def clear_disconnect(cfg=None):
+    p = disconnect_path(cfg)
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+
+
+def disabled_adapter_path(boot_cfg=None):
+    base = HOME_DIR
+    if boot_cfg and boot_cfg.get("user_rules"):
+        base = os.path.dirname(boot_cfg["user_rules"])
+    return os.path.join(base, "disabled_adapter.txt")
+
+
+def set_disabled_adapter(name, boot_cfg=None):
+    """记下"为了断开校园网而禁用了哪块网卡"。
+
+    必须记住具体名字：网卡一旦被禁用，"自动挑选有线网卡"就可能挑到另一块
+    （比如已禁用的"本地连接"），恢复时就会启用错的那块。
+    """
+    try:
+        with open(disabled_adapter_path(boot_cfg), "w", encoding="utf-8") as fh:
+            fh.write(str(name or ""))
+        return True
+    except Exception:
+        return False
+
+
+def get_disabled_adapter(boot_cfg=None):
+    try:
+        with open(disabled_adapter_path(boot_cfg), "r", encoding="utf-8-sig") as fh:
+            return fh.read().strip()
+    except Exception:
+        return ""
+
+
+def clear_disabled_adapter(boot_cfg=None):
+    try:
+        os.remove(disabled_adapter_path(boot_cfg))
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------
 # 「翻墙模式正在用代理」标记
 #
