@@ -143,13 +143,22 @@ DEFAULT_CONFIG = {
         "wifi_policy": "off",            # off / manual=全部改手动连接 / disable=禁用网卡
     },
     "flip": {
-        "enabled": False,                # 翻墙模式：没连校园网时，打开指定程序才开 VPN
-        "order": ["eix", "mojie"],       # 客户端尝试顺序
+        "enabled": False,                # 翻墙模式：打开指定程序就开 VPN
+        # 什么时候允许翻墙：
+        #   off_campus = 只在没连校园网时（默认，避免代理干扰校园网认证）
+        #   always     = 任何时候都翻墙，连着校园网也开（认证完成后再开代理）
+        "when": "off_campus",
+        "order": ["eix", "mojie"],       # 勾选允许使用的客户端（只有勾选的 id 写在这里）
         "apps": ["telegram.exe", "codex.exe", "chrome.exe"],
         "region_hints": ["美国", "united states", "america", "🇺🇸", "los angeles", "san jose",
                          "seattle", "dallas", "new york", "chicago", "miami", "usla",
                          "us-", "us_", "-us"],
-        "title_hints": ["chatgpt", "openai", "claude", "gemini", "perplexity", "sora"],
+        # 浏览器靠"窗口标题里出现这些关键词"判断（避免一开浏览器就翻墙）
+        "title_hints": ["chatgpt", "openai", "claude", "gemini", "perplexity", "sora",
+                        "google", "youtube", "twitter", "x.com", "facebook", "instagram",
+                        "wikipedia", "reddit", "discord", "github", "notion", "medium",
+                        "stackoverflow", "stack overflow", "huggingface", "copilot",
+                        "bing.com", "duckduckgo"],
         "auto_close": False,             # 触发程序全部退出后是否自动关掉客户端
     },
     "clients": DEFAULT_CLIENTS,
@@ -357,6 +366,58 @@ def pause_active(path=None, cfg=None):
             return float(fh.read().strip()) > time.time()
     except Exception:
         return False
+
+
+# --------------------------------------------------------------------------
+# 「翻墙模式正在用代理」标记
+#
+# 翻墙模式打开代理后会写这个文件；系统级守护读到它（且足够新）就**不关代理**，
+# 否则"连着校园网就关代理"的规则会把刚开起来的 E-IX 在 20 秒内杀掉 ——
+# 这正是"打开 Google 翻不了墙"的根因。
+# 用时间戳而不是"文件存在与否"，所以进程被强杀时也不会留下永久豁免。
+# --------------------------------------------------------------------------
+FLIP_ACTIVE_FILE = "flip.active"
+FLIP_ACTIVE_FRESH = 180          # 秒：多久没刷新就算翻墙模式已经不活跃了
+
+
+def flip_active_path(boot_cfg=None):
+    base = HOME_DIR
+    if boot_cfg and boot_cfg.get("user_rules"):
+        base = os.path.dirname(boot_cfg["user_rules"])
+    return os.path.join(base, FLIP_ACTIVE_FILE)
+
+
+def set_flip_active(client="", note=""):
+    """写/刷新标记。翻墙模式在代理运行期间应定期调用（例如每 30 秒一次）。"""
+    path = flip_active_path(None)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("%.0f\t%s\t%s" % (time.time(), client or "", note or ""))
+        return True
+    except Exception:
+        return False
+
+
+def clear_flip_active():
+    try:
+        os.remove(flip_active_path(None))
+        return True
+    except Exception:
+        return False
+
+
+def flip_active(boot_cfg=None, max_age=None):
+    """返回 (是否活跃, 客户端, 说明, 距今秒数)。"""
+    max_age = FLIP_ACTIVE_FRESH if max_age is None else max_age
+    try:
+        with open(flip_active_path(boot_cfg), "r", encoding="utf-8-sig") as fh:
+            parts = fh.read().strip().split("\t")
+        age = time.time() - float(parts[0])
+        return (age <= max_age), (parts[1] if len(parts) > 1 else ""), \
+            (parts[2] if len(parts) > 2 else ""), age
+    except Exception:
+        return False, "", "", -1.0
 
 
 def set_pause(minutes=10):
