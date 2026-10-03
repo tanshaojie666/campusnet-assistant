@@ -54,7 +54,10 @@ def kill_processes(processes, log=None, graceful=True):
 def flip_triggered(rules, conn=None):
     """“需要翻墙的程序”是不是正在用？
 
-    进程名直接匹配；浏览器（chrome/msedge）按窗口标题关键词判断。
+    进程名直接匹配；浏览器有两种判断方式：
+      · 默认：看**窗口标题**里有没有关键词（避免一开浏览器就翻墙）
+      · 勾上「浏览器一打开就翻墙」（flip.browser_always）：只看进程在不在 ——
+        最可靠，不受标题语言/报错页/新标签页影响
     返回 (是否触发, 是什么触发的)。
     """
     flip = rules.get("flip") or {}
@@ -69,7 +72,19 @@ def flip_triggered(rules, conn=None):
         if pids_of(procs, a):
             return True, a
     if any(a in browsers for a in apps):
+        # ① 只看进程：最可靠（用户明确要求"打开浏览器就翻墙"时用）
+        if flip.get("browser_always"):
+            for b in browsers:
+                if b in apps and pids_of(procs, b):
+                    return True, "浏览器已打开（%s）" % b
+        # ② 看窗口标题里的关键词
         hints = [str(h).lower() for h in (flip.get("title_hints") or [])]
+        if not hints:
+            # 一个关键词都没配：退化成"浏览器开着就算"，免得永远不触发
+            for b in browsers:
+                if b in apps and pids_of(procs, b):
+                    return True, "浏览器已打开（%s，未配置标题关键词）" % b
+            return False, ""
         for t in window_titles():
             low = t.lower()
             if any(h in low for h in hints):
