@@ -12,6 +12,8 @@ import os
 import json
 import queue
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -28,7 +30,8 @@ from .net import (build_prober, campus_link_state, pppoe_connections, ppp_state,
                   ras_dial, ras_hangup, wifi_profiles)
 from .clients import ensure_client_ready
 from .rules import flip_triggered
-from .util import TrayIcon, dpapi_decrypt, dpapi_encrypt, list_processes, pids_of
+from .util import TrayIcon, create_no_window_flag, dpapi_decrypt, dpapi_encrypt, \
+    list_processes, pids_of
 
 MODE_LABEL = {"wired": "有线拨号", "wireless": "无线", "both": "有线+无线"}
 
@@ -48,6 +51,7 @@ class App:
         self.boot_alive = False
         self.snap = {}
         self.log_lines = []
+        self.code_mtime = self._code_mtime()      # 用于"程序更新后自动重启"
 
         root.title("%s · 校园网助手" % APP_TITLE)
         root.minsize(720, 620)
@@ -84,6 +88,7 @@ class App:
         self.root.after(150, self._pump)
         self.root.after(400, self._refresh_boot_state)
         self.root.after(600, self._refresh_status)
+        self.root.after(15000, self._check_self_update)
         threading.Thread(target=self._watchdog, daemon=True).start()
         threading.Thread(target=self._flip_watch, daemon=True).start()
 
@@ -930,6 +935,86 @@ class App:
     def check_now(self):
         self._refresh_status()
 
+    # ------------------------------------------------------- 自动更新（换新版本）
+    @staticmethod
+    def _code_mtime():
+        """程序包（campusnet/*.py）里最新的修改时间。"""
+        latest = 0.0
+        base = os.path.dirname(os.path.abspath(__file__))
+        try:
+            for name in os.listdir(base):
+                if name.endswith((".py", ".pyw")):
+                    try:
+                        latest = max(latest, os.path.getmtime(os.path.join(base, name)))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return latest
+
+    def restart_self(self):
+        """用新代码把自己重新启动（界面会闪一下，托盘图标会回来）。
+
+        为什么要这个：程序更新后，正在跑的旧进程仍然执行内存里的旧代码 ——
+        以前必须让用户手动关掉再打开。现在检测到文件变化就自动换新版本，
+        避免"修好了但没生效"。
+        """
+        try:
+            self.stop_event.set()
+            clear_flip_active()
+            self.tray.remove()
+        except Exception:
+            pass
+        # 先把自己持有的单实例锁放掉，否则新实例会以为"已经有程序在跑"而不启动
+        try:
+            if getattr(self, "gui_mutex", None):
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.gui_mutex))
+                self.gui_mutex = None
+        except Exception:
+            pass
+        exe = sys.executable or "python.exe"
+        if exe.lower().endswith("python.exe"):
+            cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            if os.path.isfile(cand):
+                exe = cand
+        entry = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             "CampusNetAssistant.pyw")
+        args = [exe, entry, "--minimized"]
+        ok = False
+        try:
+            subprocess.Popen(args, close_fds=True,
+                             creationflags=create_no_window_flag())
+            ok = True
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self.log("自动重启失败（%s），请手动关掉再打开一次。" % exc, "err")
+            except Exception:
+                pass
+        if ok:
+            try:
+                self.log("程序文件已更新，已自动重启为新版本（窗口收到托盘里）。", "ok")
+            except Exception:
+                pass
+        self.closing = True
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def _check_self_update(self):
+        """每 15 秒看一眼程序文件有没有被更新过。"""
+        if self.closing:
+            return
+        try:
+            if self._code_mtime() > self.code_mtime:
+                self.log("检测到程序文件已更新，正在自动重启以加载新版本…", "warn")
+                self.root.after(600, self.restart_self)
+                return
+        except Exception:
+            pass
+        self.root.after(15000, self._check_self_update)
+
     # ------------------------------------------------------- 登录自启
     @staticmethod
     def _startup_path():
@@ -1302,12 +1387,36 @@ class App:
 
 def run_gui(minimized=False, cfg=None):
     cfg = cfg or load_config()
+
+    # 只允许一个界面实例：重复点桌面快捷方式会开出第二个，
+    # 两个检测器同时干活反而互相干扰。已有实例时提示一下并退出。
+    # 注意要给"自更新重启"留出交接时间：老实例是先放锁再拉新实例，
+    # 所以这里等几秒再判定。
+    import ctypes
+    from .util import named_mutex
+    handle = None
+    for _ in range(8):
+        handle = named_mutex("Global\\CampusNetAssistant.Gui")
+        if handle is not None:
+            break
+        time.sleep(1)
+    if handle is None:
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                None, "校园网助手已经在运行了。\n\n"
+                      "请看屏幕右下角托盘里的图标，双击它就能打开窗口。",
+                "校园网助手", 0x40)
+        except Exception:
+            pass
+        return 0
+
     root = tk.Tk()
     try:
         root.call("tk", "scaling", 1.2)
     except Exception:
         pass
     app = App(root, cfg)
+    app.gui_mutex = handle
     if minimized:
         try:
             root.withdraw() if app.tray_ok else root.iconify()
