@@ -18,7 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import config as C
-from .clients import client_by_id, scan_clients
+from .clients import client_by_id, client_installed, scan_clients
 from .config import (APP_TITLE, HOME_DIR, LOG_FILE, heartbeat_state,
                      load_config, load_rules, save_config, save_rules,
                      set_account, set_pause)
@@ -238,19 +238,26 @@ class App:
         ttk.Checkbutton(f, text="启用翻墙模式：**没连校园网**时，打开指定程序才自动开代理并切到可用节点",
                         variable=self.flip_var).pack(anchor="w")
 
-        cl = ttk.LabelFrame(f, text=" 翻墙客户端（可选、可调顺序：从上到下依次尝试） ", padding=12)
+        cl = ttk.LabelFrame(f, text=" 翻墙客户端（勾选允许使用的；列表顺序 = 尝试顺序） ", padding=12)
         cl.pack(fill="both", expand=True, pady=(10, 0))
-        self.client_list = tk.Listbox(cl, font=("Consolas", 10), height=6)
+        self.client_list = tk.Listbox(cl, font=("Consolas", 10), height=7, selectmode="extended",
+                                      activestyle="none")
         self.client_list.pack(fill="both", expand=True)
+        self.client_list.bind("<Double-Button-1>", lambda _e: self.toggle_client())
+        self.client_list.bind("<space>", lambda _e: self.toggle_client())
         cb = ttk.Frame(cl)
         cb.pack(fill="x", pady=(6, 0))
-        ttk.Button(cb, text="↑ 上移", command=lambda: self._move(self.client_list, -1)).pack(side="left")
-        ttk.Button(cb, text="↓ 下移", command=lambda: self._move(self.client_list, 1)).pack(side="left", padx=6)
-        ttk.Button(cb, text="扫描本机已装客户端", command=self._scan_clients).pack(side="left")
-        ttk.Label(cl, foreground="#5f6368", font=("Microsoft YaHei UI", 9),
-                  text="提示：多数 mihomo/Clash 客户端可以直接用「自带内核 + 自己的配置」启动，"
+        ttk.Button(cb, text="勾选 / 取消勾选", command=self.toggle_client).pack(side="left")
+        ttk.Button(cb, text="↑ 上移", command=lambda: self._move_client(-1)).pack(side="left", padx=(8, 0))
+        ttk.Button(cb, text="↓ 下移", command=lambda: self._move_client(1)).pack(side="left", padx=4)
+        ttk.Button(cb, text="只留勾选的", command=self.keep_checked_clients).pack(side="left", padx=(8, 0))
+        ttk.Button(cb, text="扫描本机已装客户端", command=self._scan_clients).pack(side="left", padx=4)
+        ttk.Label(cl, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="☑ = 允许使用；只勾 E-IX 就只尝试 E-IX。双击某一行也能切换。\n"
+                       "提示：多数 mihomo/Clash 客户端可以直接用「自带内核 + 自己的配置」启动，"
                        "不需要开界面、不需要管理员权限。").pack(anchor="w", pady=(6, 0))
-        self._fill_list(self.client_list, self.cfg["flip"].get("order") or [])
+        self._client_rows = []
+        self.refresh_client_list()
 
         ap = ttk.LabelFrame(f, text=" 触发程序（打开这些程序时才会开代理） ", padding=12)
         ap.pack(fill="both", expand=True, pady=(10, 0))
@@ -329,6 +336,66 @@ class App:
         n = simpledialog.askstring("手动输入", "进程名（例如 chatgpt.exe）：")
         if n:
             self._add_to(self.app_list, n if n.lower().endswith(".exe") else n + ".exe")
+
+    # ------------------------------------------------------- 翻墙客户端清单
+    def refresh_client_list(self):
+        """把「所有已定义客户端 + 当前勾选状态」画进列表。
+
+        列表顺序 = 尝试顺序；勾选状态 = 是否允许使用（存进 flip.order 的只有勾选的）。
+        """
+        order = list((self.cfg.get("flip") or {}).get("order") or [])
+        all_ids = [c.get("id") for c in (self.cfg.get("clients") or []) if c.get("id")]
+        # 先按已保存的顺序排，剩下的按配置里的定义顺序补上
+        shown = [i for i in order if i in all_ids] + [i for i in all_ids if i not in order]
+        self._client_rows = [(i, i in order) for i in shown]
+        self.client_list.delete(0, "end")
+        for cid, on in self._client_rows:
+            c = client_by_id(self.cfg, cid) or {}
+            installed = "已装" if client_installed(c) else "未装"
+            self.client_list.insert("end", "%s %-12s %-12s %s"
+                                    % ("☑" if on else "☐", cid, c.get("name") or "", installed))
+
+    def toggle_client(self):
+        for idx in self.client_list.curselection():
+            cid, on = self._client_rows[idx]
+            self._client_rows[idx] = (cid, not on)
+        self.client_list.delete(0, "end")
+        for cid, on in self._client_rows:
+            c = client_by_id(self.cfg, cid) or {}
+            installed = "已装" if client_installed(c) else "未装"
+            self.client_list.insert("end", "%s %-12s %-12s %s"
+                                    % ("☑" if on else "☐", cid, c.get("name") or "", installed))
+
+    def _move_client(self, delta):
+        sel = list(self.client_list.curselection())
+        if not sel:
+            return
+        if delta < 0:
+            for idx in sel:
+                if idx > 0:
+                    row = self._client_rows.pop(idx)
+                    self._client_rows.insert(idx - 1, row)
+        else:
+            for idx in reversed(sel):
+                if idx < len(self._client_rows) - 1:
+                    row = self._client_rows.pop(idx)
+                    self._client_rows.insert(idx + 1, row)
+        checked = [c for c, on in self._client_rows if on]
+        self.refresh_client_list()
+        # 尽量保持原来选中的行
+        for idx, (cid, _on) in enumerate(self._client_rows):
+            if cid in checked:
+                self.client_list.selection_set(idx)
+
+    def keep_checked_clients(self):
+        """把勾选的挪到最前面（没勾的留在后面，方便再勾回来）。"""
+        checked = [r for r in self._client_rows if r[1]]
+        unchecked = [r for r in self._client_rows if not r[1]]
+        self._client_rows = checked + unchecked
+        self.refresh_client_list()
+
+    def checked_client_ids(self):
+        return [cid for cid, on in self._client_rows if on]
 
     def _scan_clients(self):
         lines = []
@@ -887,7 +954,7 @@ class App:
         cfg["guard"]["kill_processes"] = self._list_items(self.kill_list)
         cfg["guard"]["wifi_policy"] = self.wifi_policy_var.get()
         cfg["flip"]["enabled"] = bool(self.flip_var.get())
-        cfg["flip"]["order"] = self._list_items(self.client_list)
+        cfg["flip"]["order"] = self.checked_client_ids() or []      # 只有勾选的客户端会被使用
         cfg["flip"]["apps"] = self._list_items(self.app_list)
         cfg["flip"]["region_hints"] = [x.strip() for x in self.region_var.get().replace("、", ",").split(",") if x.strip()]
         cfg["flip"]["title_hints"] = [x.strip() for x in self.title_var.get().replace("、", ",").split(",") if x.strip()]
