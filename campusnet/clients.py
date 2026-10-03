@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.parse
@@ -156,9 +157,14 @@ def launch_client(client, log=None):
     if core and core_dir and core_cfg and os.path.isfile(core) \
             and os.path.isfile(os.path.join(core_dir, core_cfg)):
         _log("用 %s 自带内核直接启动（沿用它的节点和规则，无需界面/UAC）…" % client.get("name"))
+        args = [core, "-d", core_dir, "-f", os.path.join(core_dir, core_cfg)]
+        # 显式指定控制接口：有些客户端的配置文件里没这一项，而内核支持用
+        # -ext-ctl 覆盖 —— 这样一定能拿到 API，不然就只能干等。
+        ctl = str(client.get("controller") or "").strip()
+        if ctl:
+            args += ["-ext-ctl", ctl]
         try:
-            subprocess.Popen([core, "-d", core_dir, "-f", os.path.join(core_dir, core_cfg)],
-                             close_fds=True, stdout=subprocess.DEVNULL,
+            subprocess.Popen(args, close_fds=True, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL,
                              creationflags=create_no_window_flag())
             return True, "core"
@@ -254,6 +260,45 @@ def pick_node(port, region_hints, log=None, max_test=8):
     return best
 
 
+def config_port(client, key="mixed-port"):
+    """从客户端自己的配置里读端口（按行找，不依赖 YAML 解析）。
+
+    有些内核是定制版、**根本没有控制接口**（例如 E-IX 的 mihomo 会把
+    external-controller 和 -ext-ctl 都忽略掉），但代理端口是正常的 ——
+    这种情况就靠这个函数拿到该用哪个端口。
+    """
+    _gui, _core, core_dir, core_cfg = client_paths(client)
+    if not core_dir or not core_cfg:
+        return 0
+    path = os.path.join(core_dir, core_cfg)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = re.match(r"\s*[\"']?%s[\"']?\s*:\s*(\d+)" % re.escape(key), line)
+                if m:
+                    return int(m.group(1))
+    except Exception:
+        pass
+    return 0
+
+
+def probe_via_proxy(mixed_port, url="http://www.gstatic.com/generate_204", timeout=10):
+    """通过这个代理端口真的发一个请求 —— 能返回 200/204 就说明代理链路通了。
+
+    这比"端口在监听"可靠得多：端口在监听不等于节点可用。
+    """
+    if not mixed_port:
+        return False
+    proxy = "http://127.0.0.1:%d" % int(mixed_port)
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        with opener.open(url, timeout=timeout) as resp:
+            return resp.status in (200, 204)
+    except Exception:
+        return False
+
+
 def enable_proxy_for(port, log=None):
     """把系统代理指向这个客户端的混合端口。"""
     mixed = 0
@@ -268,8 +313,13 @@ def enable_proxy_for(port, log=None):
     return 0
 
 
-def ensure_client_ready(cfg, order, log=None, wait_rounds=10):
+def ensure_client_ready(cfg, order, log=None, wait_seconds=None):
     """按顺序尝试客户端：启动 → 等控制接口 → 切到目标地区节点 → 设系统代理。
+
+    注意：内核**首次启动可能要下载规则集**（配置里 rule-providers 指向上游 URL）。
+    这段时间代理端口 7890-7893 已经能连，但控制接口还没开 —— 如果只等十几秒，
+    就会被误判成"客户端起不来/需要在界面里手动连接"。所以默认等 180 秒，
+    并每隔一段时间打一条进度日志。可用环境变量 CNA_CONTROLLER_WAIT 调整。
 
     返回 (是否成功, 客户端名, 节点名, client_id)。
     """
@@ -277,6 +327,11 @@ def ensure_client_ready(cfg, order, log=None, wait_rounds=10):
         if log:
             log(m)
 
+    if wait_seconds is None:
+        try:
+            wait_seconds = int(os.environ.get("CNA_CONTROLLER_WAIT") or 180)
+        except ValueError:
+            wait_seconds = 180
     hints = (cfg.get("flip") or {}).get("region_hints") or []
     order = [k for k in (order or []) if client_by_id(cfg, k)]
     if not order:
@@ -295,13 +350,30 @@ def ensure_client_ready(cfg, order, log=None, wait_rounds=10):
                 _log("  启动失败：%s" % how)
                 continue
         port = None
-        for _ in range(wait_rounds):
+        deadline = time.time() + wait_seconds
+        next_tip = time.time() + 30
+        while time.time() < deadline:
             time.sleep(2)
             port = find_controller(c)
             if port:
                 break
+            if time.time() >= next_tip:
+                next_tip = time.time() + 30
+                _log("  还在等 %s 的控制接口（首次启动要下载规则集，慢的话要一两分钟，"
+                     "最多再等 %d 秒）…" % (c.get("name"), max(0, int(deadline - time.time()))))
         if not port:
-            _log("  %s 的控制接口没出现（它可能需要在界面里手动连接），换下一个"
+            # 控制接口拿不到 → 退化成"直接用它自己的代理端口"。
+            # 为什么需要这条：有些内核是定制版，会把 external-controller / -ext-ctl
+            # 全部忽略（E-IX 就是这样），但代理功能完全正常。这时虽然没法自动挑节点，
+            # 可它记住的那个节点通常是能用的 —— 能上网总比一点也不通强。
+            mixed = config_port(c)
+            if mixed and probe_via_proxy(mixed):
+                if set_system_proxy(True, "127.0.0.1:%d" % mixed):
+                    _log("  %s 没有控制接口（内核是定制版），但它自己的代理端口 %d 已经能上网"
+                         " → 直接用它记住的节点（这种模式下无法自动换节点）。"
+                         % (c.get("name"), mixed))
+                    return True, "%s（自带节点）" % c.get("name"), "(客户端自己记住的节点)", key
+            _log("  %s 的控制接口没出现，代理端口也不通（可在它界面里手动连一次），换下一个"
                  % c.get("name"))
             continue
         _log("  %s 控制接口 127.0.0.1:%d" % (c.get("name"), port))
