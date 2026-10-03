@@ -93,10 +93,12 @@ def main() -> int:
     ap.add_argument("--description", default="校园网自动接入（有线/无线可选）+ 翻墙模式："
                                              "打开指定程序时自动开代理并切到可用节点。纯 Python 标准库。")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--no-files", action="store_true",
+                    help="只处理 Release（跳过推送仓库文件），修附件时用")
     ap.add_argument("--release", metavar="TAG",
                     help="更新完文件后创建 GitHub Release（例如 v1.2.0）")
     ap.add_argument("--asset", action="append", default=[],
-                    help="附加到 Release 的本地文件，可重复（例如打包好的 zip）")
+                    help="附加到 Release 的本地文件，可重复；可用 路径::远端文件名 指定名字")
     ap.add_argument("--notes-file", default="",
                     help="Release 说明文件（markdown）；留空则自动从 CHANGELOG.md 取对应版本那段")
     ap.add_argument("--prerelease", action="store_true", help="标记为预发布")
@@ -104,11 +106,14 @@ def main() -> int:
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     files = collect_files(root)
-    print("准备上传 %d 个文件（来自 %s）" % (len(files), root))
-    for rel, _full in files[:200]:
-        print("   ", rel)
-    if len(files) > 200:
-        print("    … 还有 %d 个" % (len(files) - 200))
+    if args.no_files:
+        print("跳过仓库文件（--no-files），只处理 Release。")
+    else:
+        print("准备上传 %d 个文件（来自 %s）" % (len(files), root))
+        for rel, _full in files[:200]:
+            print("   ", rel)
+        if len(files) > 200:
+            print("    … 还有 %d 个" % (len(files) - 200))
     if args.dry_run:
         print("\n--dry-run：没有真的上传。")
         return 0
@@ -160,7 +165,7 @@ def main() -> int:
         print("仓库已存在，将更新其中的文件：", repo.get("html_url"))
 
     ok, fail = 0, []
-    for rel, full in files:
+    for rel, full in ([] if args.no_files else files):
         with open(full, "rb") as fh:
             content = base64.b64encode(fh.read()).decode("ascii")
         path = "/repos/%s/%s/contents/%s" % (owner, args.repo, rel)
@@ -179,10 +184,11 @@ def main() -> int:
             fail.append((rel, s, info))
             print("   × %s (%s)" % (rel, s))
 
-    print("\n完成：成功 %d 个，失败 %d 个" % (ok, len(fail)))
-    for rel, s, info in fail:
-        print("   × %s -> %s %s" % (rel, s, str(info)[:120]))
-    print("\n仓库地址：", repo.get("html_url"))
+    if not args.no_files:
+        print("\n完成：成功 %d 个，失败 %d 个" % (ok, len(fail)))
+        for rel, s, info in fail:
+            print("   × %s -> %s %s" % (rel, s, str(info)[:120]))
+        print("\n仓库地址：", repo.get("html_url"))
 
     if args.release:
         publish_release(op, token, owner, args)
@@ -210,9 +216,29 @@ def extract_notes(root: str, tag: str) -> str:
     return "\n".join(out).strip()
 
 
-def upload_asset(op, token, owner, repo_name, release_id, path):
+def asset_name(path: str, override: str = "") -> str:
+    """给 GitHub 用的附件名：只保留 ASCII。
+
+    GitHub 的 uploads API 对非 ASCII 名字处理不靠谱（中文名会变成 "-.zip"），
+    所以统一转成 ASCII 短横线形式；本地文件名不受影响。
+    """
+    raw = override or os.path.basename(path)
+    stem, ext = os.path.splitext(raw)
+    clean = "".join(ch if (ch.isascii() and (ch.isalnum() or ch in "-_.")) else "-"
+                    for ch in stem)
+    while "--" in clean:
+        clean = clean.replace("--", "-")
+    clean = clean.strip("-.") or "asset"
+    return clean + (ext if ext else "")
+
+
+def delete_asset(op, token, owner, repo_name, asset_id):
+    return api(op, token, "DELETE", "/repos/%s/%s/releases/assets/%d"
+               % (owner, repo_name, asset_id))
+
+
+def upload_asset(op, token, owner, repo_name, release_id, path, name):
     """把本地文件作为 Release 附件上传。"""
-    name = os.path.basename(path)
     url = ("https://uploads.github.com/repos/%s/%s/releases/%d/assets?name=%s"
            % (owner, repo_name, release_id, urllib.parse.quote(name)))
     with open(path, "rb") as fh:
@@ -222,7 +248,7 @@ def upload_asset(op, token, owner, repo_name, release_id, path):
     req.add_header("Content-Type", "application/octet-stream")
     req.add_header("User-Agent", "CampusNetAssistant-publisher")
     try:
-        with op.open(req, timeout=600) as resp:
+        with op.open(req, timeout=1800) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8", "replace") or "{}")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
@@ -234,7 +260,10 @@ def upload_asset(op, token, owner, repo_name, release_id, path):
 
 
 def publish_release(op, token, owner, args):
-    """创建 tag + Release，并上传附件。"""
+    """创建（或复用已有）tag + Release，并上传附件。
+
+    可重复执行：Release 已存在就复用，同名附件先删再传。
+    """
     tag, repo_name = args.release, args.repo
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     notes = ""
@@ -246,27 +275,40 @@ def publish_release(op, token, owner, args):
     if not notes:
         notes = "见 [CHANGELOG.md](CHANGELOG.md)"
 
-    print("\n创建 Release %s …" % tag)
-    status, rel = api(op, token, "POST", "/repos/%s/%s/releases" % (owner, repo_name), {
-        "tag_name": tag, "name": tag, "body": notes,
-        "draft": False, "prerelease": bool(args.prerelease),
-    })
-    if status not in (200, 201):
-        print("× 创建 Release 失败（%s）：%s" % (status, str(rel)[:200]))
-        return
-    print("√ Release 已创建：", rel.get("html_url"))
+    status, rel = api(op, token, "GET",
+                      "/repos/%s/%s/releases/tags/%s" % (owner, repo_name, tag))
+    if status == 200:
+        print("\nRelease %s 已存在，复用：%s" % (tag, rel.get("html_url")))
+    else:
+        print("\n创建 Release %s …" % tag)
+        status, rel = api(op, token, "POST", "/repos/%s/%s/releases" % (owner, repo_name), {
+            "tag_name": tag, "name": tag, "body": notes,
+            "draft": False, "prerelease": bool(args.prerelease),
+        })
+        if status not in (200, 201):
+            print("× 创建 Release 失败（%s）：%s" % (status, str(rel)[:200]))
+            return
+        print("√ Release 已创建：", rel.get("html_url"))
 
-    for path in args.asset or []:
+    # 附件：支持 "本地路径::远端文件名"，中文名会自动转 ASCII
+    for spec in args.asset or []:
+        path, _, override = spec.partition("::")
         if not os.path.isfile(path):
             print("   ! 附件不存在，跳过：%s" % path)
             continue
-        print("   上传附件 %s（%.1f MB）…" % (os.path.basename(path),
-                                        os.path.getsize(path) / 1048576.0))
-        s, info = upload_asset(op, token, owner, repo_name, rel["id"], path)
+        name = asset_name(path, override)
+        for old in rel.get("assets") or []:
+            if old.get("name") == name:
+                delete_asset(op, token, owner, repo_name, old["id"])
+                print("   已删除同名旧附件：%s" % name)
+        print("   上传附件 %s → %s（%.1f MB）…" % (os.path.basename(path), name,
+                                             os.path.getsize(path) / 1048576.0))
+        s, info = upload_asset(op, token, owner, repo_name, rel["id"], path, name)
         if s in (200, 201):
             print("   ↑ 成功：%s" % info.get("browser_download_url"))
         else:
             print("   × 上传失败（%s）：%s" % (s, str(info)[:200]))
+    print("\nRelease 页面：%s" % rel.get("html_url"))
 
 
 if __name__ == "__main__":
