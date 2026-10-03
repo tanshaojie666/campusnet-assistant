@@ -148,6 +148,13 @@ DEFAULT_CONFIG = {
         # 默认关闭：手动断开就保持断开，直到点「立即连接」。打开后断开就真的不用管。
         "reconnect_when_no_flip": False,
         "reconnect_after": 180,          # 断开多久、且确认没在用代理之后才恢复（秒）
+        # 「跟着 VPN 走」：以"有没有在用代理"为准自动切网络，保证随时都有网 ——
+        #   VPN 在跑 → 断开校园网（校园网里翻墙会认证失败）+ 连上下面的无线（手机热点）
+        #   VPN 一停 → 立刻把校园网连回来
+        # 这是最省心的一种用法：你只管开/关 VPN，网络自己跟着换。
+        "follow_vpn": False,
+        "vpn_hotspot_ssid": "",          # 翻墙时用哪个无线（填手机热点名；留空=不主动连）
+        "vpn_switch_delay": 10,          # VPN 关掉后多少秒切回校园网（越小越"立刻"）
     },
     "flip": {
         "enabled": False,                # 翻墙模式：打开指定程序就开 VPN
@@ -232,8 +239,8 @@ def rules_path(cfg=None) -> str:
 
 def load_rules(cfg=None):
     d = {"kill_proxies": True, "processes": list(DEFAULT_CONFIG["guard"]["kill_processes"]),
-         "wifi_policy": "off", "reconnect_when_no_flip": False,
-         "flip": dict(DEFAULT_CONFIG["flip"])}
+         "wifi_policy": "off", "reconnect_when_no_flip": False, "follow_vpn": False,
+         "vpn_hotspot_ssid": "", "flip": dict(DEFAULT_CONFIG["flip"])}
     data = json_load(rules_path(cfg) if cfg else RULES_FILE, None)
     if isinstance(data, dict):
         if "enabled" in data:                 # 兼容旧字段名
@@ -242,6 +249,10 @@ def load_rules(cfg=None):
             d["kill_proxies"] = bool(data["kill_proxies"])
         if "reconnect_when_no_flip" in data:
             d["reconnect_when_no_flip"] = bool(data["reconnect_when_no_flip"])
+        if "follow_vpn" in data:
+            d["follow_vpn"] = bool(data["follow_vpn"])
+        if "vpn_hotspot_ssid" in data:
+            d["vpn_hotspot_ssid"] = str(data["vpn_hotspot_ssid"] or "")
         if data.get("processes"):
             d["processes"] = [str(x).lower() for x in data["processes"]]
         if data.get("wifi_policy") in ("off", "manual", "disable"):
@@ -259,6 +270,8 @@ def save_rules(rules):
     data["processes"] = [str(x).lower() for x in rules.get("processes", [])]
     data["wifi_policy"] = rules.get("wifi_policy", "off")
     data["reconnect_when_no_flip"] = bool(rules.get("reconnect_when_no_flip", False))
+    data["follow_vpn"] = bool(rules.get("follow_vpn", False))
+    data["vpn_hotspot_ssid"] = str(rules.get("vpn_hotspot_ssid") or "")
     data["flip"] = dict(rules.get("flip", {}))
     json_dump(RULES_FILE, data)
     return True

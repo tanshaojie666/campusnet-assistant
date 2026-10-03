@@ -327,6 +327,24 @@ class TestRuntimeSignals(unittest.TestCase):
         from campusnet.util import process_age_seconds
         self.assertIsNone(process_age_seconds(0x7FFFFFFF))
 
+    def test_follow_vpn_defaults_off(self):
+        """「跟着 VPN 走」默认关闭：不想被自动切网络的人应该不受影响。"""
+        guard = DEFAULT_CONFIG["guard"]
+        self.assertFalse(guard["follow_vpn"])
+        self.assertEqual(guard["vpn_hotspot_ssid"], "")
+        self.assertLessEqual(guard["vpn_switch_delay"], 60)   # 关掉 VPN 后要"立刻"切回
+
+    def test_follow_vpn_roundtrip(self):
+        """这两个值必须能通过 rules.json 传给系统级守护（界面改了立刻生效）。"""
+        C.save_rules({"kill_proxies": True, "processes": [], "wifi_policy": "off",
+                      "follow_vpn": True, "vpn_hotspot_ssid": "iPhone", "flip": {}})
+        r = C.load_rules(None)
+        self.assertTrue(r["follow_vpn"])
+        self.assertEqual(r["vpn_hotspot_ssid"], "iPhone")
+        C.save_rules({"kill_proxies": True, "processes": [], "wifi_policy": "off",
+                      "follow_vpn": False, "vpn_hotspot_ssid": "", "flip": {}})
+        self.assertFalse(C.load_rules(None)["follow_vpn"])
+
     def test_network_choice_lifecycle(self):
         """手动切换网络的选择：切走要记住（自动逻辑让路），切回要清掉。"""
         self.assertEqual(C.get_network_choice(), "")

@@ -18,7 +18,7 @@ from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
                      connect_requested, disabled_adapter_path, disconnect_requested,
                      flip_active, get_disabled_adapter, get_network_choice,
                      heartbeat_state, load_boot_config, load_rules, pause_active,
-                     set_disabled_adapter)
+                     set_disabled_adapter, set_pause)
 from .clients import scan_clients
 from .net import (adapter_ip, apply_wifi_policy, campus_link_state, clear_stale_dials,
                   friendly_error, pppoe_connections, ppp_state, ppp_state_cached,
@@ -104,6 +104,15 @@ def boot_mode():
     err756 = 0                      # 连续 756 的次数（用来判断要不要重启 RasMan）
     last_dial_ts = 0.0              # 上次拨号的时间（两次之间至少隔 MIN_DIAL_GAP 秒）
     last_missing_log = 0.0          # "用着别的网但校园网没连上"这条日志的节流
+    # 「跟着 VPN 走」
+    follow_vpn = bool(guard_cfg.get("follow_vpn"))
+    vpn_hotspot_ssid = str(guard_cfg.get("vpn_hotspot_ssid") or "")
+    try:
+        vpn_switch_delay = max(5, int(guard_cfg.get("vpn_switch_delay") or 10))
+    except (TypeError, ValueError):
+        vpn_switch_delay = 10
+    vpn_last_on = 0.0               # 最近一次"检测到在用代理"的时间
+    vpn_restored = False            # 这一轮翻墙结束后是否已经把校园网切回来了
     link_started = 0.0            # 校园网链路是什么时候连上的（用于 KILL_WINDOW 判断）
     flip_logged = False           # 「翻墙模式在用代理」这条日志只记一次，避免刷屏
     mtime = _script_mtime()
@@ -131,6 +140,10 @@ def boot_mode():
     except Exception as exc:  # noqa: BLE001
         boot_log("开机状态判断出错（已忽略）：%s" % exc)
 
+    if follow_vpn:
+        boot_log("「跟着 VPN 走」已开启：翻墙时连「%s」，VPN 关闭后 %.0f 秒切回校园网。"
+                 % (vpn_hotspot_ssid or "(未指定无线，只断开校园网)", vpn_switch_delay))
+
     while True:
         if os.path.isfile(BOOT_STOP):
             try:
@@ -152,6 +165,9 @@ def boot_mode():
             guard_rules = cfg.get("guard") or {}
             reconnect_no_flip = bool(rules.get("reconnect_when_no_flip",
                                                guard_rules.get("reconnect_when_no_flip")))
+            follow_vpn = bool(rules.get("follow_vpn", guard_rules.get("follow_vpn")))
+            vpn_hotspot_ssid = str(rules.get("vpn_hotspot_ssid")
+                                   or guard_rules.get("vpn_hotspot_ssid") or "")
             procs_snapshot = list_processes() or {}
 
             if wifi_policy != "off" and time.time() - last_wifi > 600:
@@ -218,6 +234,55 @@ def boot_mode():
                 link_started = 0.0
                 last_dial_ts = 0.0          # 允许本轮立刻拨
                 time.sleep(2 if fixed else 0)
+
+            # 「跟着 VPN 走」：以"有没有在用代理"为准自动切网络，保证随时都有网 ——
+            #   VPN 在跑 → 断开校园网（校园网里翻墙会认证失败）+ 连上指定的无线（手机热点）
+            #   VPN 一停 → 立刻把校园网连回来
+            # 手动选择过网络（无线/全断）时不插手，用户的明确选择优先。
+            if follow_vpn and get_network_choice(cfg) not in ("wifi", "none"):
+                flip_on2, _fc2, _fn2, _fage2 = flip_active(cfg)
+                proxying = flip_on2 or any(pids_of(procs_snapshot, n) for n in processes)
+                if proxying:
+                    vpn_last_on = time.time()
+                    vpn_restored = False
+                    if not pause_active(pause_file, cfg):
+                        set_pause(24 * 60)
+                        boot_log("检测到正在使用代理（翻墙中）→ 暂停校园网自动拨号。")
+                    # 断开校园网（复用已验证的两步断开：先 rasdial，不行就禁网卡）
+                    up2, ip2 = ppp_state_cached(connection, link_cache) if connection \
+                        else (False, "")
+                    if up2 and connection:
+                        ras_hangup(connection, phonebook)
+                        time.sleep(3)
+                        if ppp_state(connection)[0]:
+                            from .net import pick_wired_adapter
+                            ad = get_disabled_adapter(cfg) or pick_wired_adapter(wired_cfg)
+                            if ad:
+                                set_disabled_adapter(ad, cfg)
+                                if set_adapter_disabled(ad, True):
+                                    boot_log("翻墙中 → 已断开校园网（禁用网卡「%s」）。" % ad)
+                        else:
+                            boot_log("翻墙中 → 已断开校园网（%s 已释放）。" % (ip2 or "IP"))
+                        link_cache["t"] = 0
+                    # 保证有网：连上指定的无线（手机热点）
+                    if vpn_hotspot_ssid:
+                        from .net import wifi_connect, wifi_connected_ssid
+                        cur = (wifi_connected_ssid() or "").strip()
+                        if cur.lower() != vpn_hotspot_ssid.lower():
+                            boot_log("翻墙中 → 连接无线「%s」保证有网。" % vpn_hotspot_ssid)
+                            wifi_connect(vpn_hotspot_ssid)
+                            time.sleep(5)
+                            link_cache["t"] = 0
+                elif (vpn_last_on and not vpn_restored
+                      and (time.time() - vpn_last_on) >= vpn_switch_delay):
+                    vpn_restored = True
+                    clear_pause(cfg)
+                    from .net import enable_disabled_wired_adapters
+                    fixed = enable_disabled_wired_adapters(boot_log)
+                    boot_log("代理已关闭 → %s切回校园网。"
+                             % ("已恢复网卡，" if fixed else ""))
+                    link_cache["t"] = 0
+                    last_dial_ts = 0.0
 
             # 「立即连接」后把上次断开时禁用的网卡恢复回来。
             # 这里**不依赖"禁用了哪块"的记录**：记录一旦丢失，网卡就会一直禁用，

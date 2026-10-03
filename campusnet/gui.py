@@ -249,6 +249,22 @@ class App:
         ttk.Checkbutton(kill, variable=self.reconnect_var,
                         text="断开后如果一直没在用代理（没在翻墙），就自动把校园网连回来").pack(
             anchor="w", pady=(6, 0))
+
+        # ---- 跟着 VPN 走：一个开关解决"翻墙时用热点、关掉 VPN 立刻回校园网" ----
+        self.follow_vpn_var = tk.BooleanVar(value=bool(self.cfg["guard"].get("follow_vpn")))
+        ttk.Checkbutton(kill, variable=self.follow_vpn_var,
+                        text="跟着 VPN 走：翻墙时断开校园网并连下面这个无线，"
+                             "VPN 一关就立刻切回校园网").pack(anchor="w", pady=(8, 0))
+        frow = ttk.Frame(kill)
+        frow.pack(fill="x", pady=(2, 0))
+        ttk.Label(frow, text="翻墙时连接：").pack(side="left")
+        self.vpn_ssid_var = tk.StringVar(
+            value=self.cfg["guard"].get("vpn_hotspot_ssid") or "")
+        ttk.Combobox(frow, textvariable=self.vpn_ssid_var, font=self.font, width=26,
+                     values=wifi_profiles()).pack(side="left", padx=6)
+        ttk.Label(frow, text="（手机热点名；留空=不主动连）",
+                  foreground="#5f6368").pack(side="left")
+
         ttk.Label(kill, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
                   text="勾上之后：为翻墙而点「断开」→ 翻完墙 / 没在翻墙 → 自动恢复校园网，"
                        "你就不用管了。\n判定「没在用代理」看的是翻墙标记 + 上面的关闭名单里的进程。"
@@ -1151,6 +1167,8 @@ class App:
         cfg["guard"]["kill_processes"] = self._list_items(self.kill_list)
         cfg["guard"]["wifi_policy"] = self.wifi_policy_var.get()
         cfg["guard"]["reconnect_when_no_flip"] = bool(self.reconnect_var.get())
+        cfg["guard"]["follow_vpn"] = bool(self.follow_vpn_var.get())
+        cfg["guard"]["vpn_hotspot_ssid"] = self.vpn_ssid_var.get().strip()
         cfg["flip"]["enabled"] = bool(self.flip_var.get())
         cfg["flip"]["when"] = self.flip_when_var.get() or "off_campus"
         cfg["flip"]["browser_always"] = bool(self.browser_always_var.get())
@@ -1164,6 +1182,8 @@ class App:
         rules["processes"] = cfg["guard"]["kill_processes"]
         rules["wifi_policy"] = cfg["guard"]["wifi_policy"]
         rules["reconnect_when_no_flip"] = cfg["guard"]["reconnect_when_no_flip"]
+        rules["follow_vpn"] = cfg["guard"]["follow_vpn"]
+        rules["vpn_hotspot_ssid"] = cfg["guard"]["vpn_hotspot_ssid"]
         rules["flip"] = cfg["flip"]
         save_rules(rules)
         if cfg["campus"]["account"] and self.pwd_var.get():
@@ -1396,6 +1416,7 @@ class App:
         """
         cache, last_try, told = {}, 0.0, 0.0
         own_key = ""            # 本程序亲自开起来的客户端；只要它还活着就保持标记
+        wait_until = 0.0        # 「跟着 VPN 走」时：等校园网断开再开代理的截止时间
         while not self.stop_event.is_set():
             try:
                 rules = load_rules(None)
@@ -1422,14 +1443,39 @@ class App:
                                                      s.get("ssid"), cache,
                                                      self.cfg["campus"].get("wired") or {})
                         allowed = (not up) or (policy == "always")
-                        if not allowed:
+                        follow = bool(rules.get("follow_vpn"))
+                        if not allowed and follow:
+                            # 「跟着 VPN 走」：翻墙本来就要离开校园网 ——
+                            # 主动请求守护断开校园网，断开后再开代理。
+                            # 不能在校园网还连着的时候开代理：守护的策略是
+                            # "连着校园网就关代理"，刚开的代理会被立刻杀掉。
+                            if up and not wait_until:
+                                request_disconnect("翻墙模式启动 → 断开校园网")
+                                wait_until = time.time() + 90
+                                self.log("检测到 %s：按「跟着 VPN 走」的规则，"
+                                         "先请守护断开校园网（约 15 秒），断开后再开代理。"
+                                         % what, "warn")
+                            elif up and time.time() > wait_until:
+                                wait_until = 0.0
+                                if time.time() - told > 300:
+                                    told = time.time()
+                                    self.log("校园网还没断开，暂不开代理（避免和守护互相打）。"
+                                             "可以点「断开」，或稍后再试。", "warn")
+                            if not up:
+                                wait_until = 0.0
+                                allowed = True
+                        elif not up:
+                            wait_until = 0.0
+                        if not allowed and not follow:
                             if time.time() - told > 600:
                                 told = time.time()
                                 self.log("检测到 %s，但现在连着校园网（%s）—— 当前规则是"
                                          "「只在没连校园网时翻墙」，所以不开。"
                                          "想让连着校园网也能翻墙，到「翻墙模式」页把"
-                                         "「什么时候翻墙」改成「任何时候」。" % (what, desc), "warn")
-                        else:
+                                         "「什么时候翻墙」改成「任何时候」。"
+                                         "（或者到「校园网」页勾上「跟着 VPN 走」，"
+                                         "它会自动断开校园网再翻墙）" % (what, desc), "warn")
+                        if allowed:
                             procs = list_processes() or {}
                             running = any(pids_of(procs, n)
                                           for c in (self.cfg.get("clients") or [])
