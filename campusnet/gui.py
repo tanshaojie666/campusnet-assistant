@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import os
+import json
 import queue
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -107,6 +109,8 @@ class App:
         ttk.Button(bar, text="断开", command=self.disconnect).pack(side="left", padx=6)
         ttk.Button(bar, text="立即检查", command=self.check_now).pack(side="left")
         ttk.Button(bar, text="保存设置", command=self.save).pack(side="left", padx=6)
+        ttk.Button(bar, text="导出设置…", command=self.export_config).pack(side="left")
+        ttk.Button(bar, text="导入设置…", command=self.import_config).pack(side="left", padx=6)
         ttk.Button(bar, text="打开日志", command=self.open_log).pack(side="left")
         ttk.Button(bar, text="退出程序", command=self.quit_app).pack(side="right")
 
@@ -358,7 +362,7 @@ class App:
     def wired_dialog(self):
         """有线接入的详细设置：网卡 / 静态 IP / 门户认证 / 学校客户端 / 802.1X。"""
         from tkinter import filedialog
-        from .net import wired_adapters
+        from .net import PORTAL_PRESETS, apply_portal_preset, wired_adapters
 
         w = self.cfg["campus"].setdefault("wired", {})
         p = w.setdefault("portal", {})
@@ -409,8 +413,23 @@ class App:
         nb.add(t2, text="  Web 门户认证  ")
         ttk.Label(t2, text="拿到 IP 后需要打开登录页输账号的情况（深信服 / 锐捷 / Dr.COM 等）",
                   foreground="#5f6368", font=("Microsoft YaHei UI", 9)).pack(anchor="w")
+
+        # 厂商预设：一键把常见字段名填好
+        from .net import PORTAL_PRESETS
+        preset_row = ttk.Frame(t2)
+        preset_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(preset_row, text="厂商预设：", font=self.font).pack(side="left")
+        preset_var = tk.StringVar(value="")
+        preset_labels = [PORTAL_PRESETS[k]["label"] for k in PORTAL_PRESETS]
+        preset_box = ttk.Combobox(preset_row, textvariable=preset_var, values=preset_labels,
+                                  font=self.font, width=22, state="readonly")
+        preset_box.pack(side="left", padx=(4, 8))
+        preset_note = ttk.Label(t2, text="", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                                wraplength=560, justify="left")
+        preset_note.pack(anchor="w", pady=(4, 0))
+
         p_mode = tk.StringVar(value=p.get("mode") or "auto")
-        ttk.Label(t2, text="方式：", font=self.font).pack(anchor="w", pady=(10, 2))
+        ttk.Label(t2, text="方式：", font=self.font).pack(anchor="w", pady=(8, 2))
         for val, text in (("auto", "自动（打开登录页 → 找表单 → 填账号密码 → 提交）"),
                           ("template", "按模板提交（知道门户接口时最准，兼容各种厂商）"),
                           ("script", "执行命令（学校给了脚本或命令行工具时最省事）")):
@@ -436,11 +455,57 @@ class App:
                 row=i, column=1, sticky="ew", pady=3)
         ttk.Label(t2, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
                   text="模板里可用占位符：{username} {password}。\n"
-                       "例：深信服常见为 POST 到 /ac_portal/login.php，"
-                       "内容 opr=pwdLogin&userName={username}&pwd={password}；\n"
-                       "锐捷常见为 /eportal/InterFace.do?method=login；"
-                       "Dr.COM 各校不同，建议先用“自动”或抓一次登录请求照抄。").pack(
+                       "各校字段名可能不同，最稳的办法是：先手动登录一次门户 → F12 → "
+                       "Network → 找到那条登录请求 → 照抄地址和内容。").pack(
             anchor="w", pady=(10, 0))
+
+        def apply_preset(_event=None):
+            want = None
+            for key, item in PORTAL_PRESETS.items():
+                if item["label"] == preset_var.get():
+                    want = key
+                    break
+            if not want:
+                return
+            merged, note = apply_portal_preset({}, want)
+            if merged.get("mode"):
+                p_mode.set(merged["mode"])
+            for key, widget_key in (("url", "url"), ("method", "method"), ("body", "body")):
+                if merged.get(key) is not None:
+                    p_vars[widget_key].set(str(merged.get(key) or ""))
+            preset_note.configure(text=note)
+
+        preset_box.bind("<<ComboboxSelected>>", apply_preset)
+
+        def test_portal():
+            """按当前填的内容真的试一次门户认证，把过程打到主窗口日志里。"""
+            cfg_try = {
+                "mode": p_mode.get(),
+                "url": p_vars["url"].get().strip(),
+                "method": p_vars["method"].get().strip() or "post",
+                "body": p_vars["body"].get().strip(),
+                "script": p_vars["script"].get().strip(),
+                "probe_url": p_vars["probe_url"].get().strip(),
+                "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+            }
+            user = p_vars["username"].get().strip() or self.snap.get("account", "")
+            pwd = p_vars["password"].get() or self.snap.get("password", "")
+            self.log("— 开始测试门户认证（方式：%s）—" % cfg_try["mode"], "warn")
+
+            def run():
+                from .net import portal_login, portal_probe
+                online, page = portal_probe(cfg_try.get("probe_url") or None)
+                if online:
+                    self.log("现在就已经能上网（没被门户拦住）——不需要认证。", "ok")
+                    return
+                self.log("检测到门户登录页：%s" % (page or "(没拿到)"))
+                ok, msg = portal_login(cfg_try, user, pwd, lambda m: self.log(m))
+                self.log("门户测试结果：%s（%s）" % ("成功" if ok else "未成功", msg),
+                         "ok" if ok else "err")
+
+            threading.Thread(target=run, daemon=True).start()
+
+        ttk.Button(t2, text="测试门户认证", command=test_portal).pack(anchor="w", pady=(10, 0))
 
         # ---------- 客户端 / 802.1X ----------
         t3 = ttk.Frame(nb, padding=14)
@@ -649,6 +714,44 @@ class App:
             set_account(cfg, cfg["campus"]["account"], self.pwd_var.get())
         self._sync_snap()
         return cfg
+
+    def export_config(self):
+        """把设置导出成一个 JSON 文件（密码是密文，换到别的电脑/账户要重新填）。"""
+        from tkinter import filedialog
+        try:
+            self.save()
+            path = filedialog.asksaveasfilename(
+                title="导出设置", defaultextension=".json",
+                initialfile="校园网助手-设置.json", filetypes=[("JSON 文件", "*.json")])
+            if not path:
+                return
+            shutil.copy2(CONFIG_FILE, path)
+            self.log("设置已导出：%s" % path, "ok")
+            self.log("提示：里面的密码是用本机账户加密的，换台电脑要重新填一次密码。", "warn")
+        except Exception as exc:  # noqa: BLE001
+            self.log("导出失败：%s" % exc, "err")
+
+    def import_config(self):
+        from tkinter import filedialog, messagebox
+        try:
+            path = filedialog.askopenfilename(title="导入设置",
+                                              filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")])
+            if not path:
+                return
+            with open(path, "r", encoding="utf-8-sig") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                raise ValueError("不是有效的设置文件")
+            if not messagebox.askokcancel(APP_TITLE,
+                                          "导入会覆盖当前设置（含接入方式、认证方式、名单、翻墙设置）。\n"
+                                          "确定继续吗？"):
+                return
+            with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+            self.log("设置已导入。建议关掉程序再重新打开，让各页面都刷新。", "ok")
+            messagebox.showinfo(APP_TITLE, "导入完成。请关闭程序后重新打开以生效。")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, "导入失败：%s" % exc)
 
     def save(self):
         try:
