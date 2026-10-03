@@ -205,6 +205,27 @@ python scripts\publish_github.py --token ghp_你的Token --repo CampusNetAssista
 
 **仍然建议肉眼核对**脚本打印的文件清单，尤其是截图和示例文件。
 
+### 4.5 一次提交推全部文件（不会刷爆提交历史）
+
+脚本用 GitHub 的 **Git Data API**（blobs → tree → commit → 更新分支指针）把**所有文件
+放进同一个提交**里。所以 30 个文件也只产生 **1 个提交、1 次 CI 运行**。
+
+> 早期版本用的是 Contents API"一个文件一个提交"，30 个文件就是 30 个提交、30 次 CI，
+> 提交历史会被刷得很难看（本仓库一度累积到 378 个提交）。
+
+**关于 `.github/workflows/`**：GitHub 对 workflow 目录**单独校验权限** ——
+即使 token 有 `repo`，只要没有 `workflow`，整批提交会返回 404。
+脚本遇到这种情况会**自动去掉这些文件重试**并打印一条说明：
+
+```text
+整批提交失败（404），去掉 .github/workflows/ 后重试 …
+跳过的文件：.github/workflows/ci.yml（多半是权限或不存在）
+√ 已提交 29 个文件（单个提交 3ff4b59a）
+```
+
+想让 CI 配置也能被脚本更新，就给 token 加上 `workflow` 权限
+（经典 token 勾 `workflow`，细粒度 token 勾 `Workflows: Read and write`）。
+
 ### 5. 常见报错
 
 | 现象 | 原因与解决 |
