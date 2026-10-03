@@ -247,6 +247,23 @@ def boot_mode():
 # --------------------------------------------------------------------------
 # 自检 / 扫描
 # --------------------------------------------------------------------------
+def task_status(name=None):
+    """查询计划任务，返回 (是否注册, 说明)。
+
+    区分三态：已注册 / 确实没有 / 当前权限查不了 —— 免得"权限不足"被误报成"未安装"。
+    """
+    from .util import run_cmd
+    name = name or BOOT_TASK
+    code, out = run_cmd(["schtasks", "/query", "/tn", name], timeout=30)
+    if code == 0:
+        return True, "已注册"
+    low = (out or "").lower()
+    if any(k in low for k in ("access is denied", "拒绝访问", "cannot find the path",
+                              "系统找不到指定的路径", "权限")):
+        return None, "查不到（当前权限不足，请用管理员身份运行）"
+    return False, "未注册"
+
+
 def selftest(cfg) -> int:
     from .config import heartbeat_state, rules_path
     from .net import (pick_wired_adapter, pppoe_connections, ppp_state, wifi_connected_ssid,
@@ -307,8 +324,16 @@ def selftest(cfg) -> int:
     print(line)
     print("5) 系统级守护")
     alive, desc = heartbeat_state()
-    print("   计划任务：", BOOT_TASK, "→", "已注册" if boot_task_registered() else "未注册")
+    reg, reg_msg = task_status(BOOT_TASK)
+    legacy_reg, _ = task_status("CampusNet-AutoDial-Boot")
+    print("   计划任务：", BOOT_TASK, "→", reg_msg)
     print("   守护进程：", ("运行中（%s）" % desc) if alive else "未运行")
+    if reg is None and alive:
+        print("   （上面说“查不到”只是权限问题；守护其实在跑，说明任务确实存在）")
+    if legacy_reg and reg is not True:
+        print("   注意：检测到你还在用旧任务名 CampusNet-AutoDial-Boot 启动。")
+        print("         它靠一个转发壳跑新代码 —— 只要旧文件夹还在就没问题，")
+        print("         但建议跑一次 --install-boot 注册成正式任务名，之后旧文件夹可删。")
     print("   配置：", BOOT_CONFIG, "→", "存在" if os.path.isfile(BOOT_CONFIG) else "不存在")
     print("   日志：", BOOT_LOG)
     print(line)
