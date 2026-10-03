@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = "https://api.github.com"
@@ -92,6 +93,13 @@ def main() -> int:
     ap.add_argument("--description", default="校园网自动接入（有线/无线可选）+ 翻墙模式："
                                              "打开指定程序时自动开代理并切到可用节点。纯 Python 标准库。")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--release", metavar="TAG",
+                    help="更新完文件后创建 GitHub Release（例如 v1.2.0）")
+    ap.add_argument("--asset", action="append", default=[],
+                    help="附加到 Release 的本地文件，可重复（例如打包好的 zip）")
+    ap.add_argument("--notes-file", default="",
+                    help="Release 说明文件（markdown）；留空则自动从 CHANGELOG.md 取对应版本那段")
+    ap.add_argument("--prerelease", action="store_true", help="标记为预发布")
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -175,7 +183,90 @@ def main() -> int:
     for rel, s, info in fail:
         print("   × %s -> %s %s" % (rel, s, str(info)[:120]))
     print("\n仓库地址：", repo.get("html_url"))
+
+    if args.release:
+        publish_release(op, token, owner, args)
     return 0 if not fail else 2
+
+
+def extract_notes(root: str, tag: str) -> str:
+    """从 CHANGELOG.md 里取对应版本的段落，当 Release 说明。"""
+    ver = tag.lstrip("vV")
+    try:
+        with open(os.path.join(root, "CHANGELOG.md"), "r", encoding="utf-8-sig") as fh:
+            lines = fh.read().splitlines()
+    except Exception:
+        return ""
+    out, inside = [], False
+    for line in lines:
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = ver in line
+            if inside:
+                continue
+        if inside:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def upload_asset(op, token, owner, repo_name, release_id, path):
+    """把本地文件作为 Release 附件上传。"""
+    name = os.path.basename(path)
+    url = ("https://uploads.github.com/repos/%s/%s/releases/%d/assets?name=%s"
+           % (owner, repo_name, release_id, urllib.parse.quote(name)))
+    with open(path, "rb") as fh:
+        data = fh.read()
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", "Bearer %s" % token)
+    req.add_header("Content-Type", "application/octet-stream")
+    req.add_header("User-Agent", "CampusNetAssistant-publisher")
+    try:
+        with op.open(req, timeout=600) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8", "replace") or "{}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        try:
+            body = json.loads(body)
+        except Exception:
+            pass
+        return exc.code, body
+
+
+def publish_release(op, token, owner, args):
+    """创建 tag + Release，并上传附件。"""
+    tag, repo_name = args.release, args.repo
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    notes = ""
+    if args.notes_file and os.path.isfile(args.notes_file):
+        with open(args.notes_file, "r", encoding="utf-8-sig") as fh:
+            notes = fh.read().strip()
+    if not notes:
+        notes = extract_notes(root, tag)
+    if not notes:
+        notes = "见 [CHANGELOG.md](CHANGELOG.md)"
+
+    print("\n创建 Release %s …" % tag)
+    status, rel = api(op, token, "POST", "/repos/%s/%s/releases" % (owner, repo_name), {
+        "tag_name": tag, "name": tag, "body": notes,
+        "draft": False, "prerelease": bool(args.prerelease),
+    })
+    if status not in (200, 201):
+        print("× 创建 Release 失败（%s）：%s" % (status, str(rel)[:200]))
+        return
+    print("√ Release 已创建：", rel.get("html_url"))
+
+    for path in args.asset or []:
+        if not os.path.isfile(path):
+            print("   ! 附件不存在，跳过：%s" % path)
+            continue
+        print("   上传附件 %s（%.1f MB）…" % (os.path.basename(path),
+                                        os.path.getsize(path) / 1048576.0))
+        s, info = upload_asset(op, token, owner, repo_name, rel["id"], path)
+        if s in (200, 201):
+            print("   ↑ 成功：%s" % info.get("browser_download_url"))
+        else:
+            print("   × 上传失败（%s）：%s" % (s, str(info)[:200]))
 
 
 if __name__ == "__main__":
