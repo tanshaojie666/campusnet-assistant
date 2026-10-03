@@ -26,7 +26,7 @@ from .net import (build_prober, campus_link_state, pppoe_connections, ppp_state,
                   ras_dial, ras_hangup, wifi_profiles)
 from .clients import ensure_client_ready
 from .rules import flip_triggered
-from .util import TrayIcon, list_processes, pids_of
+from .util import TrayIcon, dpapi_decrypt, dpapi_encrypt, list_processes, pids_of
 
 MODE_LABEL = {"wired": "有线拨号", "wireless": "无线", "both": "有线+无线"}
 
@@ -75,6 +75,7 @@ class App:
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._sync_snap()
+        self._refresh_wired_summary()
         self.log("程序已启动。接入方式：%s" % MODE_LABEL.get(self.snap["mode"], self.snap["mode"]))
         if self.tray_ok:
             self.log("已驻留右下角托盘：点 × 只是把窗口收起来，程序继续在后台跑。")
@@ -126,11 +127,39 @@ class App:
         box = ttk.LabelFrame(f, text=" 接入方式（可选） ", padding=12)
         box.pack(fill="x")
         self.mode_var = tk.StringVar(value=self.cfg["campus"].get("mode", "wired"))
-        for val, text in (("wired", "有线：PPPoE 拨号（常见于宿舍网口）"),
+        for val, text in (("wired", "有线（宿舍网口 / 楼道网线）"),
                           ("wireless", "无线：自动连接指定 Wi-Fi"),
                           ("both", "两者都要（有线优先，失败再连无线）")):
             ttk.Radiobutton(box, text=text, value=val, variable=self.mode_var,
                             command=self._on_mode).pack(anchor="w", pady=2)
+
+        # ---- 有线认证方式（可多选；PPPoE 之外还有 DHCP / 静态IP / 门户 / 客户端 / 802.1X）----
+        wired_box = ttk.LabelFrame(f, text=" 有线怎么认证（可多选，按此顺序执行） ", padding=12)
+        wired_box.pack(fill="x", pady=(10, 0))
+        wcfg = (self.cfg["campus"].get("wired") or {})
+        saved_auth = [str(a).lower() for a in (wcfg.get("auth") or [])]
+        if not saved_auth:
+            saved_auth = ["pppoe"] if self.cfg["campus"].get("connection") else ["dhcp"]
+        self.wired_vars = {}
+        WIRED_OPTS = [
+            ("pppoe", "PPPoE 拨号（宿舍网口最常见，需要账号密码）"),
+            ("dhcp", "自动获取 IP（插上网线就有 IP，不需要拨号）"),
+            ("static", "静态 IP（学校分配了固定 IP / 网关 / DNS）"),
+            ("portal", "Web 门户认证（打开登录页输入账号，深信服/锐捷/Dr.COM 这类）"),
+            ("client", "学校专用认证客户端（必须跑学校发的软件）"),
+            ("lan", "有线 802.1X 认证（Windows 自带，需要先建好配置）"),
+            ("restart", "先重启一次网卡再认证（相当于拔插网线，网口卡住时有用）"),
+        ]
+        for key, text in WIRED_OPTS:
+            var = tk.BooleanVar(value=key in saved_auth)
+            self.wired_vars[key] = var
+            ttk.Checkbutton(wired_box, text=text, variable=var).pack(anchor="w")
+        wb = ttk.Frame(wired_box)
+        wb.pack(fill="x", pady=(8, 0))
+        ttk.Button(wb, text="有线详细设置…", command=self.wired_dialog).pack(side="left")
+        self.wired_summary = ttk.Label(wb, text="", font=("Microsoft YaHei UI", 9),
+                                       foreground="#5f6368")
+        self.wired_summary.pack(side="left", padx=10)
 
         grid = ttk.Frame(f, padding=(0, 10, 0, 0))
         grid.pack(fill="x")
@@ -304,6 +333,178 @@ class App:
         if conns and not self.conn_var.get():
             self.conn_var.set(conns[0])
 
+    @staticmethod
+    def _wired_value_of(value):
+        """单行文本 → 去掉首尾空白（用于对话框里的小输入框）。"""
+        return str(value).strip()
+
+    def _refresh_wired_summary(self):
+        w = (self.cfg["campus"].get("wired") or {})
+        bits = ["网卡: " + (w.get("adapter") or "(自动选择)")]
+        p = w.get("portal") or {}
+        if p.get("mode"):
+            bits.append("门户: " + str(p["mode"]))
+        if p.get("url"):
+            bits.append(p["url"][:32])
+        st = w.get("static") or {}
+        if st.get("address"):
+            bits.append("静态IP: " + str(st["address"]))
+        if w.get("client_exe"):
+            bits.append("客户端: " + os.path.basename(str(w["client_exe"])))
+        if w.get("lan_profile"):
+            bits.append("802.1X: " + str(w["lan_profile"]))
+        self.wired_summary.configure(text="　|　".join(bits))
+
+    def wired_dialog(self):
+        """有线接入的详细设置：网卡 / 静态 IP / 门户认证 / 学校客户端 / 802.1X。"""
+        from tkinter import filedialog
+        from .net import wired_adapters
+
+        w = self.cfg["campus"].setdefault("wired", {})
+        p = w.setdefault("portal", {})
+        st = w.setdefault("static", {})
+        win = tk.Toplevel(self.root)
+        win.title("有线接入详细设置")
+        win.geometry("660x600")
+        win.transient(self.root)
+
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=10, pady=8)
+
+        # ---------- 网卡 / IP ----------
+        t1 = ttk.Frame(nb, padding=14)
+        nb.add(t1, text="  网卡 / IP  ")
+        ttk.Label(t1, text="有线网卡（留空自动选择“已启用且已连接”的那块）：",
+                  font=self.font).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        adapter_var = tk.StringVar(value=w.get("adapter") or "")
+        ad_box = ttk.Combobox(t1, textvariable=adapter_var, font=self.font, width=44,
+                              values=[a[0] for a in wired_adapters(include_virtual=True)])
+        ad_box.grid(row=1, column=0, sticky="ew", columnspan=2)
+        ttk.Label(t1, text="（列表里带 vEthernet/Virtual 的是虚拟网卡，一般不用选）",
+                  foreground="#5f6368", font=("Microsoft YaHei UI", 9)).grid(
+            row=2, column=0, sticky="w", pady=(2, 12))
+
+        ttk.Label(t1, text="静态 IP 设置（选了“静态 IP”方式才需要填）：",
+                  font=("Microsoft YaHei UI", 10, "bold")).grid(row=3, column=0, sticky="w",
+                                                                pady=(6, 6))
+        rows = [("IP 地址", "address", st.get("address", "")),
+                ("子网掩码", "mask", st.get("mask", "255.255.255.0")),
+                ("默认网关", "gateway", st.get("gateway", "")),
+                ("DNS（多个用逗号隔开）", "dns", "、".join(st.get("dns") or []))]
+        st_vars = {}
+        for i, (label, key, val) in enumerate(rows):
+            ttk.Label(t1, text=label + "：", font=self.font).grid(row=4 + i, column=0,
+                                                                 sticky="w", pady=4)
+            v = tk.StringVar(value=val)
+            st_vars[key] = v
+            ttk.Entry(t1, textvariable=v, font=self.font, width=34).grid(
+                row=4 + i, column=1, sticky="ew", pady=4)
+        t1.columnconfigure(1, weight=1)
+        ttk.Label(t1, text="示意图：学校给的 IP 要填全（地址+掩码+网关），否则会断网。",
+                  foreground="#5f6368", font=("Microsoft YaHei UI", 9)).grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        # ---------- 门户认证 ----------
+        t2 = ttk.Frame(nb, padding=14)
+        nb.add(t2, text="  Web 门户认证  ")
+        ttk.Label(t2, text="拿到 IP 后需要打开登录页输账号的情况（深信服 / 锐捷 / Dr.COM 等）",
+                  foreground="#5f6368", font=("Microsoft YaHei UI", 9)).pack(anchor="w")
+        p_mode = tk.StringVar(value=p.get("mode") or "auto")
+        ttk.Label(t2, text="方式：", font=self.font).pack(anchor="w", pady=(10, 2))
+        for val, text in (("auto", "自动（打开登录页 → 找表单 → 填账号密码 → 提交）"),
+                          ("template", "按模板提交（知道门户接口时最准，兼容各种厂商）"),
+                          ("script", "执行命令（学校给了脚本或命令行工具时最省事）")):
+            ttk.Radiobutton(t2, text=text, value=val, variable=p_mode).pack(anchor="w")
+
+        pf = ttk.Frame(t2)
+        pf.pack(fill="x", pady=(10, 0))
+        pf.columnconfigure(1, weight=1)
+        p_vars = {}
+        prows = [("门户地址", "url", p.get("url", ""), 48),
+                 ("请求方式(post/get)", "method", p.get("method", "post"), 48),
+                 ("提交内容模板", "body", p.get("body", "username={username}&password={password}"), 48),
+                 ("执行命令", "script", p.get("script", ""), 48),
+                 ("门户账号", "username", p.get("username", ""), 48),
+                 ("门户密码", "password", dpapi_decrypt(p.get("password_enc", "")), 48),
+                 ("判定地址", "probe_url", p.get("probe_url", ""), 48)]
+        for i, (label, key, val, width) in enumerate(prows):
+            ttk.Label(pf, text=label + "：", font=self.font).grid(row=i, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value=val)
+            p_vars[key] = v
+            show = "●" if key == "password" else ""
+            ttk.Entry(pf, textvariable=v, font=self.font, width=width, show=show).grid(
+                row=i, column=1, sticky="ew", pady=3)
+        ttk.Label(t2, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="模板里可用占位符：{username} {password}。\n"
+                       "例：深信服常见为 POST 到 /ac_portal/login.php，"
+                       "内容 opr=pwdLogin&userName={username}&pwd={password}；\n"
+                       "锐捷常见为 /eportal/InterFace.do?method=login；"
+                       "Dr.COM 各校不同，建议先用“自动”或抓一次登录请求照抄。").pack(
+            anchor="w", pady=(10, 0))
+
+        # ---------- 客户端 / 802.1X ----------
+        t3 = ttk.Frame(nb, padding=14)
+        nb.add(t3, text="  客户端 / 802.1X  ")
+        ttk.Label(t3, text="学校专用认证客户端（选了“学校客户端”方式才需要）：",
+                  font=self.font).pack(anchor="w")
+        cl = ttk.Frame(t3)
+        cl.pack(fill="x", pady=(4, 14))
+        client_var = tk.StringVar(value=w.get("client_exe") or "")
+        ttk.Entry(cl, textvariable=client_var, font=self.font, width=52).pack(side="left", fill="x",
+                                                                             expand=True)
+
+        def pick_client():
+            f = filedialog.askopenfilename(title="选择学校认证客户端", filetypes=[("程序", "*.exe")],
+                                           parent=win)
+            if f:
+                client_var.set(f)
+
+        ttk.Button(cl, text="浏览…", command=pick_client).pack(side="left", padx=6)
+
+        ttk.Label(t3, text="有线 802.1X 配置名（先用 Windows 自己建好这个配置，再填名字）：",
+                  font=self.font).pack(anchor="w")
+        lan_var = tk.StringVar(value=w.get("lan_profile") or "")
+        ttk.Entry(t3, textvariable=lan_var, font=self.font, width=52).pack(anchor="w", pady=(4, 6))
+        ttk.Label(t3, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="802.1X 怎么建：控制面板 → 网络和共享中心 → 更改适配器设置 →\n"
+                       "右键有线网卡 → 属性 → 身份验证 → 勾选“启用 IEEE 802.1X 身份验证” →\n"
+                       "选择你的认证方式并填账号密码，保存后回到这里把配置名填上。").pack(anchor="w")
+
+        # ---------- 保存 ----------
+        def save_all():
+            w["adapter"] = adapter_var.get().strip()
+            w["static"] = {
+                "address": st_vars["address"].get().strip(),
+                "mask": st_vars["mask"].get().strip() or "255.255.255.0",
+                "gateway": st_vars["gateway"].get().strip(),
+                "dns": [x.strip() for x in st_vars["dns"].get().replace("，", ",").replace("、", ",").split(",")
+                        if x.strip()],
+            }
+            w["client_exe"] = client_var.get().strip()
+            w["lan_profile"] = lan_var.get().strip()
+            p.update({
+                "mode": p_mode.get(),
+                "url": p_vars["url"].get().strip(),
+                "method": (p_vars["method"].get().strip() or "post").lower(),
+                "body": p_vars["body"].get().strip(),
+                "script": p_vars["script"].get().strip(),
+                "username": p_vars["username"].get().strip(),
+                "password_enc": dpapi_encrypt(p_vars["password"].get()) if p_vars["password"].get() else "",
+                "probe_url": p_vars["probe_url"].get().strip(),
+                "headers": p.get("headers") or {"Content-Type":
+                                                "application/x-www-form-urlencoded"},
+            })
+            self.cfg["campus"]["wired"] = w
+            self.save()
+            self._refresh_wired_summary()
+            self.log("有线详细设置已保存。", "ok")
+            win.destroy()
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        ttk.Button(bar, text="保存", command=save_all).pack(side="right")
+        ttk.Button(bar, text="取消", command=win.destroy).pack(side="right", padx=6)
+
     def _on_mode(self):
         self.log("接入方式改为：%s（保存后生效）" % MODE_LABEL.get(self.mode_var.get(), ""))
 
@@ -374,12 +575,17 @@ class App:
             campus["mode"] = self.snap.get("mode") or campus.get("mode")
             campus["connection"] = self.snap.get("connection") or campus.get("connection")
             campus["wifi_ssid"] = self.snap.get("ssid") or campus.get("wifi_ssid")
+            wired_cfg = campus.get("wired") or {}
             up, desc = campus_link_state(campus.get("mode"), campus.get("connection"),
-                                         campus.get("wifi_ssid"), {})
+                                         campus.get("wifi_ssid"), {}, wired_cfg)
             self.link_desc = desc
             prober = build_prober(campus, campus.get("connection"))
-            _ppp_up, ppp_ip = ppp_state(campus.get("connection") or "")
-            ok, ip, why = prober.check(bind_ip=ppp_ip or None)
+            from .net import wired_auth_list, wired_bind_ip
+            auths = wired_auth_list(wired_cfg, campus.get("connection") or "")
+            _ppp_up, ppp_ip = ppp_state(campus.get("connection") or "") \
+                if "pppoe" in auths else (False, "")
+            bind = ppp_ip or (wired_bind_ip(wired_cfg) if campus.get("mode") == "wired" else "")
+            ok, ip, why = prober.check(bind_ip=bind or None)
             self.online, self.local_ip, self.reason = ok, ip, why
             if ok:
                 self._set_status("已联网", "online")
@@ -421,6 +627,9 @@ class App:
         cfg["campus"]["account"] = self.user_var.get().strip()
         from .util import dpapi_encrypt
         cfg["campus"]["password_enc"] = dpapi_encrypt(self.pwd_var.get()) if self.pwd_var.get() else ""
+        # 有线认证方式（多选）
+        wired = cfg["campus"].setdefault("wired", {})
+        wired["auth"] = [k for k, v in self.wired_vars.items() if v.get()]
         cfg["guard"]["kill_proxies"] = bool(self.kill_var.get())
         cfg["guard"]["kill_processes"] = self._list_items(self.kill_list)
         cfg["guard"]["wifi_policy"] = self.wifi_policy_var.get()
@@ -459,15 +668,25 @@ class App:
         try:
             self.save()
             s = self.snap
-            if s["mode"] in ("wired", "both") and s["connection"]:
-                self.log("正在拨号（%s）…" % s["connection"])
-                ras_hangup(s["connection"])
-                code, text = ras_dial(s["connection"], s["account"], s["password"])
-                if code != 0:
-                    from .net import friendly_error
-                    self.log("拨号失败 → " + friendly_error(code, text), "err")
+            wired_cfg = self.cfg["campus"].get("wired") or {}
+            auths = [k for k, v in self.wired_vars.items() if v.get()]
+            if s["mode"] in ("wired", "both"):
+                if "pppoe" in auths and s["connection"]:
+                    self.log("正在拨号（%s）…" % s["connection"])
+                    ras_hangup(s["connection"])
+                    code, text = ras_dial(s["connection"], s["account"], s["password"])
+                    if code != 0:
+                        from .net import friendly_error
+                        self.log("拨号失败 → " + friendly_error(code, text), "err")
+                    else:
+                        self.log("拨号成功。", "ok")
+                elif any(a in auths for a in ("dhcp", "static", "portal", "client", "lan", "restart")):
+                    from .net import wired_authenticate
+                    self.log("按配置接入有线（%s）…" % "+".join(auths))
+                    wired_authenticate(wired_cfg, s.get("connection", ""),
+                                       s.get("account", ""), s.get("password", ""), self.log)
                 else:
-                    self.log("拨号成功。", "ok")
+                    self.log("没有勾选任何有线认证方式，请在上面勾一个。", "warn")
             if s["mode"] in ("wireless", "both") and s["ssid"]:
                 from .net import wifi_connect
                 self.log("正在连接无线 %s …" % s["ssid"])
@@ -540,18 +759,34 @@ class App:
             try:
                 if not self.boot_alive:
                     s = self.snap
-                    if s.get("mode") in ("wired", "both") and s.get("connection"):
-                        prober = build_prober(self.cfg["campus"], s["connection"])
-                        _up, ip = ppp_state(s["connection"])
-                        ok, _lip, _why = prober.check(bind_ip=ip or None)
-                        if not ok:
-                            from .config import pause_active
-                            if not pause_active():
-                                self.log("检测到掉线，正在自动重拨…", "warn")
-                                ras_hangup(s["connection"])
-                                code, _t = ras_dial(s["connection"], s.get("account"), s.get("password"))
-                                if code == 0:
-                                    self.log("自动重连成功。", "ok")
+                    wired_cfg = self.cfg["campus"].get("wired") or {}
+                    from .net import wired_auth_list, wired_authenticate, wired_bind_ip
+                    if s.get("mode") in ("wired", "both"):
+                        auths = wired_auth_list(wired_cfg, s.get("connection") or "")
+                        if "pppoe" in auths and s.get("connection"):
+                            prober = build_prober(self.cfg["campus"], s["connection"])
+                            _up, ip = ppp_state(s["connection"])
+                            ok, _lip, _why = prober.check(bind_ip=ip or None)
+                            if not ok:
+                                from .config import pause_active
+                                if not pause_active():
+                                    self.log("检测到掉线，正在自动重拨…", "warn")
+                                    ras_hangup(s["connection"])
+                                    code, _t = ras_dial(s["connection"], s.get("account"),
+                                                        s.get("password"))
+                                    if code == 0:
+                                        self.log("自动重连成功。", "ok")
+                        elif any(a in auths for a in ("dhcp", "static", "portal", "client",
+                                                      "lan", "restart")):
+                            prober = build_prober(self.cfg["campus"], "")
+                            ok, _lip, _why = prober.check(bind_ip=wired_bind_ip(wired_cfg) or None)
+                            if not ok:
+                                from .config import pause_active
+                                if not pause_active():
+                                    self.log("检测到掉线，按配置重新接入有线…", "warn")
+                                    wired_authenticate(wired_cfg, s.get("connection") or "",
+                                                       s.get("account", ""), s.get("password", ""),
+                                                       self.log)
             except Exception as exc:  # noqa: BLE001
                 self.log("守护线程出错（已忽略）：%s" % exc, "err")
             self._sleep(15)
@@ -567,7 +802,8 @@ class App:
                     if hit:
                         s = self.snap
                         up, desc = campus_link_state(s.get("mode"), s.get("connection"),
-                                                     s.get("ssid"), cache)
+                                                     s.get("ssid"), cache,
+                                                     self.cfg["campus"].get("wired") or {})
                         if up:
                             if time.time() - told > 600:
                                 told = time.time()
