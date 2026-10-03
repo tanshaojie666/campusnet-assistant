@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 语法检查 + 单元测试 (Windows / Python ${{ matrix.python }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: 语法检查（全部模块）
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem -Recurse -Include *.py,*.pyw
+          foreach ($f in $files) {
+            python -m py_compile $f.FullName
+            if ($LASTEXITCODE -ne 0) { throw "compile failed: $($f.FullName)" }
+          }
+          Write-Host "compiled $($files.Count) files"
+
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: 自检命令可运行
+        run: python -m campusnet --selftest
+        continue-on-error: true
