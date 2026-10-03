@@ -258,7 +258,7 @@ def build_boot_config(cfg) -> dict:
     portal = dict(wired.get("portal") or {})
     p_user, p_pwd = portal_credentials(cfg)
     portal["username"] = p_user
-    portal["password_enc"] = ""                       # 不存用户范围密文
+    portal.pop("password_enc", None)                  # 系统级配置里不带用户范围密文
     portal["password_machine"] = dpapi_encrypt(p_pwd, machine=True) if p_pwd else ""
     wired["portal"] = portal
     return {
