@@ -140,9 +140,17 @@ def boot_mode():
     except Exception as exc:  # noqa: BLE001
         boot_log("开机状态判断出错（已忽略）：%s" % exc)
 
-    if follow_vpn:
+    # 注意：开机配置可能是旧格式（没有 guard 段），所以这里从 rules.json 再确认一次，
+    # 免得"明明开了却不打日志"，排查时让人怀疑功能没生效。
+    try:
+        _r0 = load_rules(cfg)
+        _fv = bool(_r0.get("follow_vpn", follow_vpn))
+        _ssid0 = str(_r0.get("vpn_hotspot_ssid") or vpn_hotspot_ssid or "")
+    except Exception:
+        _fv, _ssid0 = follow_vpn, vpn_hotspot_ssid
+    if _fv:
         boot_log("「跟着 VPN 走」已开启：翻墙时连「%s」，VPN 关闭后 %.0f 秒切回校园网。"
-                 % (vpn_hotspot_ssid or "(未指定无线，只断开校园网)", vpn_switch_delay))
+                 % (_ssid0 or "(未指定无线，只断开校园网)", vpn_switch_delay))
 
     while True:
         if os.path.isfile(BOOT_STOP):
