@@ -380,6 +380,28 @@ class TestRuntimeSignals(unittest.TestCase):
         self.assertIn("heartbeat", src)
         self.assertIsInstance(installer.task_registered(), bool)
 
+    def test_require_other_network_default_on(self):
+        """安全闸门默认必须是开的：没有替代网络就绝不能断校园网。
+
+        否则"打开浏览器 → 断校园网 → 热点又没连 → 彻底断网"，
+        这正是用户实际踩到的坑。
+        """
+        self.assertTrue(DEFAULT_CONFIG["guard"]["require_other_network"])
+
+    def test_other_network_available_shape(self):
+        """这个函数是"能不能断校园网"的唯一依据，必须存在、且老实返回 (bool, 说明)。"""
+        import inspect
+        from campusnet import net
+        self.assertTrue(callable(net.other_network_available))
+        ok, why = net.other_network_available(DEFAULT_CONFIG)
+        self.assertIsInstance(ok, bool)
+        self.assertIsInstance(why, str)
+        self.assertTrue(why)
+        # 探测必须"真的发一个包出去"，不能只看网卡有没有 IP
+        src = inspect.getsource(net.other_network_available)
+        self.assertIn("tcp_probe", src)
+        self.assertIn("bind_ip", src)
+
     def test_tray_wnd_proc_never_calls_tk(self):
         """托盘窗口过程里**绝不能**调用 Tk。
 

@@ -27,7 +27,8 @@ from .config import (APP_TITLE, CONFIG_FILE, HOME_DIR, LOG_FILE, clear_disconnec
                      set_account, set_flip_active, set_pause)
 from .guard import boot_task_registered
 from .installer import install_boot, uninstall_boot
-from .net import (build_prober, campus_link_state, pppoe_connections, ppp_state,
+from .net import (build_prober, campus_link_state, other_network_available,
+                  pppoe_connections, ppp_state,
                   ras_dial, ras_hangup, wifi_connect, wifi_profiles)
 from .clients import ensure_client_ready
 from .rules import flip_triggered
@@ -265,6 +266,18 @@ class App:
                      values=wifi_profiles()).pack(side="left", padx=6)
         ttk.Label(frow, text="（手机热点名；留空=不主动连）",
                   foreground="#5f6368").pack(side="left")
+
+        # ★ 安全闸门：没有替代网络就绝不动校园网
+        self.require_net_var = tk.BooleanVar(
+            value=bool(self.cfg["guard"].get("require_other_network", True)))
+        ttk.Checkbutton(kill, variable=self.require_net_var,
+                        text="安全闸门：先确认手机热点/别的网真的能上网，才断开校园网"
+                             "（没确认到就什么都不做）").pack(anchor="w", pady=(6, 0))
+        ttk.Label(kill, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="勾上之后，打开浏览器时它会先检查：\n"
+                       "　· 手机热点已连上且能上网 → 才断开校园网 + 开翻墙\n"
+                       "　· 热点没连（或连了但手机没开流量）→ 校园网保持不动、翻墙也不开\n"
+                       "这是防止「为了翻墙反而把自己弄断网」的保险。").pack(anchor="w", pady=(2, 0))
 
         ttk.Label(kill, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
                   text="勾上之后：为翻墙而点「断开」→ 翻完墙 / 没在翻墙 → 自动恢复校园网，"
@@ -1226,6 +1239,7 @@ class App:
         cfg["guard"]["reconnect_when_no_flip"] = bool(self.reconnect_var.get())
         cfg["guard"]["follow_vpn"] = bool(self.follow_vpn_var.get())
         cfg["guard"]["vpn_hotspot_ssid"] = self.vpn_ssid_var.get().strip()
+        cfg["guard"]["require_other_network"] = bool(self.require_net_var.get())
         cfg["guard"]["auto_dial"] = bool(self.auto_dial_var.get())
         cfg["guard"]["kill_before_dial"] = bool(self.kill_before_var.get())
         cfg.setdefault("app", {})
@@ -1251,6 +1265,7 @@ class App:
         rules["reconnect_when_no_flip"] = cfg["guard"]["reconnect_when_no_flip"]
         rules["follow_vpn"] = cfg["guard"]["follow_vpn"]
         rules["vpn_hotspot_ssid"] = cfg["guard"]["vpn_hotspot_ssid"]
+        rules["require_other_network"] = cfg["guard"]["require_other_network"]
         rules["auto_dial"] = cfg["guard"]["auto_dial"]
         rules["kill_before_dial"] = cfg["guard"]["kill_before_dial"]
         rules["flip"] = cfg["flip"]
@@ -1486,6 +1501,7 @@ class App:
         cache, last_try, told = {}, 0.0, 0.0
         own_key = ""            # 本程序亲自开起来的客户端；只要它还活着就保持标记
         wait_until = 0.0        # 「跟着 VPN 走」时：等校园网断开再开代理的截止时间
+        told_net = 0.0          # "正在试着连热点"这条日志的节流
         while not self.stop_event.is_set():
             try:
                 rules = load_rules(None)
@@ -1513,29 +1529,57 @@ class App:
                                                      self.cfg["campus"].get("wired") or {})
                         allowed = (not up) or (policy == "always")
                         follow = bool(rules.get("follow_vpn"))
-                        if not allowed and follow:
-                            # 「跟着 VPN 走」：翻墙本来就要离开校园网 ——
-                            # 主动请求守护断开校园网，断开后再开代理。
-                            # 不能在校园网还连着的时候开代理：守护的策略是
-                            # "连着校园网就关代理"，刚开的代理会被立刻杀掉。
-                            if up and not wait_until:
-                                request_disconnect("翻墙模式启动 → 断开校园网")
-                                wait_until = time.time() + 90
-                                self.log("检测到 %s：按「跟着 VPN 走」的规则，"
-                                         "先请守护断开校园网（约 15 秒），断开后再开代理。"
-                                         % what, "warn")
-                            elif up and time.time() > wait_until:
-                                wait_until = 0.0
-                                if time.time() - told > 300:
+                        require_alt = bool(rules.get("require_other_network", True))
+                        hotspot = str(rules.get("vpn_hotspot_ssid") or "").strip()
+
+                        if up and follow:
+                            # ★ 安全闸门：断开校园网之前，必须先确认"有别的能上网的路"。
+                            # 没有（手机热点没连/连了但没流量）就**什么都不做** ——
+                            # 校园网保持连接、翻墙也不开。否则一断就彻底没网了。
+                            ok_net, why = True, "未开启安全闸门"
+                            if require_alt:
+                                ok_net, why = other_network_available(self.cfg, hotspot)
+                                if not ok_net and hotspot and time.time() - told_net > 120:
+                                    told_net = time.time()
+                                    self.log("检测到 %s：翻墙要先有别的网，正在试着连「%s」…"
+                                             % (what, hotspot), "warn")
+                                    try:
+                                        if hotspot in wifi_profiles():
+                                            wifi_connect(hotspot)
+                                            time.sleep(6)
+                                    except Exception:
+                                        pass
+                                    ok_net, why = other_network_available(self.cfg, hotspot)
+                            if not ok_net:
+                                # 没有替代网络 → 校园网不动、翻墙不开
+                                if time.time() - told > 180:
                                     told = time.time()
-                                    self.log("校园网还没断开，暂不开代理（避免和守护互相打）。"
-                                             "可以点「断开」，或稍后再试。", "warn")
-                            if not up:
-                                wait_until = 0.0
-                                allowed = True
+                                    self.log("检测到 %s，但**没有可用的热点/其他网络**（%s）→ "
+                                             "校园网保持连接，翻墙也不开。\n"
+                                             "　想翻墙：先把手机热点打开、让电脑连上，"
+                                             "再打开浏览器就行。" % (what, why), "warn")
+                                allowed = False
+                            else:
+                                if not wait_until:
+                                    self.log("已确认有可用网络（%s）→ 断开校园网，"
+                                             "断开后自动开翻墙。" % why)
+                                    request_disconnect("翻墙启动：已确认有替代网络 → 断开校园网")
+                                    wait_until = time.time() + 90
+                                elif time.time() > wait_until:
+                                    wait_until = 0.0
+                                    if time.time() - told > 300:
+                                        told = time.time()
+                                        self.log("校园网还没断开，暂不开代理"
+                                                 "（避免和守护互相打）。可以点「断开」，"
+                                                 "或稍后再试。", "warn")
+                                if not up:
+                                    wait_until = 0.0
+                                    allowed = True
+                                else:
+                                    allowed = False     # 等校园网真的断了再开代理
                         elif not up:
                             wait_until = 0.0
-                        if not allowed and not follow:
+                        elif not allowed:
                             if time.time() - told > 600:
                                 told = time.time()
                                 self.log("检测到 %s，但现在连着校园网（%s）—— 当前规则是"

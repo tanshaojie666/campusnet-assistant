@@ -151,6 +151,12 @@ check("门户探测（只读，不登录）",
 check("网卡禁用/启用函数存在（不实际调用）",
       lambda: need(callable(net.set_adapter_disabled) and callable(net.adapter_enabled),
                    "存在"))
+check("★安全闸门：有别的能上网的路吗（真实探测）",
+      lambda: "可用=%s（%s）" % net.other_network_available(C.load_config(),
+                                                          C.load_config()["guard"]
+                                                          .get("vpn_hotspot_ssid") or ""))
+check("安全闸门开关默认开着",
+      lambda: need(C.DEFAULT_CONFIG["guard"]["require_other_network"] is True, "默认 True"))
 
 # ---------------------------------------------------------------- 5 翻墙客户端
 print("\n【5】翻墙客户端")

@@ -412,6 +412,79 @@ def campus_link_state(mode, connection="", wifi_ssid="", cache=None, wired_cfg=N
 # ==========================================================================
 # 有线接入：除了 PPPoE 拨号，还支持 DHCP / 静态 IP / 门户认证 / 专用客户端 / 802.1X
 # ==========================================================================
+def _other_network_candidates(cfg=None):
+    """可能"能上网"的网卡候选：(IP, 说明)。已排除校园网自己用的那张。"""
+    campus = ((cfg or {}).get("campus") or {}) if isinstance(cfg, dict) else {}
+    conn = (campus.get("connection") or "").strip()
+    campus_wifi = (campus.get("wifi_ssid") or "").strip().lower()
+    try:
+        campus_ip = ppp_state(conn)[1] if conn else ""
+    except Exception:
+        campus_ip = ""
+    ssid = wifi_connected_ssid()
+    wifi_names = wifi_interfaces() if (ssid and ssid.lower() != campus_wifi) else []
+    names = list(wifi_names)
+    try:
+        names += [t[0] for t in wired_adapters(include_virtual=True)]
+    except Exception:
+        pass
+    out, seen = [], set()
+    for name in names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ip = adapter_ip(name)
+        if not ip or ip == campus_ip or ip.startswith(("169.254.", "127.", "0.")):
+            continue
+        if name in wifi_names:
+            label = "无线「%s」" % ssid
+        else:
+            label = "网卡「%s」" % name
+        out.append((ip, label))
+    return out
+
+
+def other_network_available(cfg=None, hotspot_ssid=""):
+    """有没有"别的能上网的路"（手机热点 / 别的无线 / 第二条网线 / USB 共享）。
+
+    这是「翻墙前先确认有替代网络」的核心判断：**只有替代网络真的能上网，
+    才允许断开校园网** —— 否则一断就彻底没网了。
+
+    判定方式是**真的从那张网卡发一个 TCP 包出去**（socket 绑定源 IP，
+    走的就是那张网卡），所以下面这些情况不会被误判成"可用"：
+      · 手机热点连上了，但手机没开数据流量
+      · 连上了某个无线，但它自己也没网
+      · 虚拟网卡（Hyper-V / WSL / VMware）有 IP 但出不去
+
+    返回 (是否可用, 说明)。
+    """
+    cands = _other_network_candidates(cfg)
+    if not cands:
+        return False, "没发现别的网络（现在只有校园网）"
+    hosts = []
+    try:
+        conn = ((cfg or {}).get("campus") or {}).get("connection") or ""
+        for h in (ppp_dns_servers(conn) or []):
+            if h:
+                hosts.append((h, 53))
+    except Exception:
+        pass
+    hosts += [("223.5.5.5", 53), ("119.29.29.29", 53), ("180.76.76.76", 53)]
+    for ip, label in cands:
+        for host, port in hosts[:3]:
+            try:
+                if tcp_probe(host, port, timeout=1.6, bind_ip=ip):
+                    return True, "%s 能上网（%s）" % (label, ip)
+            except Exception:
+                continue
+    return False, "%s 都上不了网" % "、".join(l for _i, l in cands[:3])
+
+
+def other_network_available_simple(cfg=None):
+    """只判断"有没有别的已连接网络"，不做联网探测（更快，但不够准）。"""
+    return bool(_other_network_candidates(cfg))
+
+
 def wired_auth_list(wired_cfg, connection=""):
     """取有线认证方式列表；没配就按有没有拨号连接推断。"""
     auths = [str(a).lower() for a in ((wired_cfg or {}).get("auth") or [])]

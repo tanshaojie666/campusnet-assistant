@@ -163,6 +163,9 @@ DEFAULT_CONFIG = {
         "follow_vpn": False,
         "vpn_hotspot_ssid": "",          # 翻墙时用哪个无线（填手机热点名；留空=不主动连）
         "vpn_switch_delay": 10,          # VPN 关掉后多少秒切回校园网（越小越"立刻"）
+        # **安全闸门**：断开校园网之前必须先确认"有别的能上网的路"（手机热点等）。
+        # 没有就什么都不做 —— 否则一断校园网就彻底没网了。
+        "require_other_network": True,
     },
     "flip": {
         "enabled": False,                # 翻墙模式：打开指定程序就开 VPN
@@ -249,7 +252,8 @@ def load_rules(cfg=None):
     d = {"kill_proxies": True, "processes": list(DEFAULT_CONFIG["guard"]["kill_processes"]),
          "wifi_policy": "off", "reconnect_when_no_flip": False, "follow_vpn": False,
          "auto_dial": True, "kill_before_dial": True,
-         "vpn_hotspot_ssid": "", "flip": dict(DEFAULT_CONFIG["flip"])}
+         "vpn_hotspot_ssid": "", "require_other_network": True,
+         "flip": dict(DEFAULT_CONFIG["flip"])}
     data = json_load(rules_path(cfg) if cfg else RULES_FILE, None)
     if isinstance(data, dict):
         if "enabled" in data:                 # 兼容旧字段名
@@ -266,6 +270,8 @@ def load_rules(cfg=None):
             d["kill_before_dial"] = bool(data["kill_before_dial"])
         if "vpn_hotspot_ssid" in data:
             d["vpn_hotspot_ssid"] = str(data["vpn_hotspot_ssid"] or "")
+        if "require_other_network" in data:
+            d["require_other_network"] = bool(data["require_other_network"])
         if data.get("processes"):
             d["processes"] = [str(x).lower() for x in data["processes"]]
         if data.get("wifi_policy") in ("off", "manual", "disable"):
@@ -287,6 +293,7 @@ def save_rules(rules):
     data["kill_before_dial"] = bool(rules.get("kill_before_dial", True))
     data["follow_vpn"] = bool(rules.get("follow_vpn", False))
     data["vpn_hotspot_ssid"] = str(rules.get("vpn_hotspot_ssid") or "")
+    data["require_other_network"] = bool(rules.get("require_other_network", True))
     data["flip"] = dict(rules.get("flip", {}))
     json_dump(RULES_FILE, data)
     return True
