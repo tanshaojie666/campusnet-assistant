@@ -9,6 +9,9 @@
 
 **English:** CampusNetAssistant is a dependency-free Windows utility (pure Python standard library + tkinter) that keeps your campus network connected, closes the proxy/VPN clients that break campus authentication, and — when you launch a program that needs it — automatically starts your chosen proxy client, picks the fastest working node by real latency testing, and turns on the system proxy. No third-party packages, no telemetry, passwords encrypted with Windows DPAPI.
 
+> 📖 **完全不懂网络也能看懂** → 看 [**完整使用说明（大白话版）**](docs/使用说明.md)
+> 里面有每个功能"干嘛用、什么时候需要、怎么开"，还有三个可以直接照抄的典型用法。
+
 ### Quick Start (English)
 
 ```text
@@ -571,6 +574,7 @@ CampusNetAssistant/
 │  ├─ uninstall-boot.cmd     卸载
 │  └─ publish_github.py      半自动发布脚本（见 PUBLISH.md，支持 --release 发版）
 ├─ docs/
+│  ├─ 使用说明.md            完整使用说明（大白话版，每个功能都讲到）
 │  ├─ WIRED.md               有线接入方式详解（重点看这个）
 │  ├─ CLIENTS.md             如何添加翻墙客户端
 │  └─ images/                界面截图（占位）
