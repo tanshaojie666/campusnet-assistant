@@ -112,6 +112,10 @@ class App:
         ttk.Button(bar, text="导出设置…", command=self.export_config).pack(side="left")
         ttk.Button(bar, text="导入设置…", command=self.import_config).pack(side="left", padx=6)
         ttk.Button(bar, text="打开日志", command=self.open_log).pack(side="left")
+        ttk.Button(bar, text="检查更新", command=self.check_update).pack(side="left", padx=6)
+        self.autostart_var = tk.BooleanVar(value=self._startup_entry_exists())
+        ttk.Checkbutton(bar, text="登录后自动打开", variable=self.autostart_var,
+                        command=self.toggle_autostart).pack(side="left")
         ttk.Button(bar, text="退出程序", command=self.quit_app).pack(side="right")
 
         ttk.Label(f, text="运行日志", font=self.font).pack(anchor="w")
@@ -161,6 +165,7 @@ class App:
         wb = ttk.Frame(wired_box)
         wb.pack(fill="x", pady=(8, 0))
         ttk.Button(wb, text="有线详细设置…", command=self.wired_dialog).pack(side="left")
+        ttk.Button(wb, text="网页（门户）认证设置…", command=self.portal_dialog).pack(side="left", padx=6)
         self.wired_summary = ttk.Label(wb, text="", font=("Microsoft YaHei UI", 9),
                                        foreground="#5f6368")
         self.wired_summary.pack(side="left", padx=10)
@@ -680,8 +685,191 @@ class App:
             pass
         self.root.after(15000, self._refresh_boot_state)
 
+    def portal_dialog(self):
+        """网页（门户）认证 —— 有线无线共用的一份设置。"""
+        from .net import PORTAL_PRESETS, apply_portal_preset
+        p = self.cfg["campus"].setdefault("portal", {})
+        win = tk.Toplevel(self.root)
+        win.title("网页（门户）认证设置")
+        win.geometry("640x560")
+        win.transient(self.root)
+
+        ttk.Label(win, justify="left", font=("Microsoft YaHei UI", 9), foreground="#5f6368",
+                  text="适用：连上网后打开网页会跳登录页的校园网（有线或无线都可能这样）。\n"
+                       "有线和无线共用这一份设置。").pack(anchor="w", padx=14, pady=(12, 6))
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=14)
+        ttk.Label(row, text="厂商预设：", font=self.font).pack(side="left")
+        preset_var = tk.StringVar(value="")
+        preset_box = ttk.Combobox(row, textvariable=preset_var, font=self.font, width=24,
+                                  state="readonly",
+                                  values=[PORTAL_PRESETS[k]["label"] for k in PORTAL_PRESETS])
+        preset_box.pack(side="left", padx=(4, 8))
+        note = ttk.Label(win, text="", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                         wraplength=580, justify="left")
+        note.pack(anchor="w", padx=14, pady=(6, 0))
+
+        mode_var = tk.StringVar(value=p.get("mode") or "auto")
+        ttk.Label(win, text="方式：", font=self.font).pack(anchor="w", padx=14, pady=(8, 2))
+        for val, text in (("auto", "自动（打开登录页 → 找表单 → 填账号密码 → 提交）"),
+                          ("template", "按模板提交（知道门户接口时最准，兼容各种厂商）"),
+                          ("script", "执行命令（学校给了脚本或命令行工具时最省事）")):
+            ttk.Radiobutton(win, text=text, value=val, variable=mode_var).pack(anchor="w", padx=14)
+
+        pf = ttk.Frame(win, padding=(14, 10, 14, 0))
+        pf.pack(fill="x")
+        pf.columnconfigure(1, weight=1)
+        p_vars = {}
+        rows = [("门户地址", "url", p.get("url", "")),
+                ("请求方式(post/get)", "method", p.get("method", "post")),
+                ("提交内容模板", "body", p.get("body", "username={username}&password={password}")),
+                ("执行命令", "script", p.get("script", "")),
+                ("门户账号", "username", p.get("username", "")),
+                ("门户密码", "password", dpapi_decrypt(p.get("password_enc", ""))),
+                ("判定地址", "probe_url", p.get("probe_url", ""))]
+        for i, (label, key, val) in enumerate(rows):
+            ttk.Label(pf, text=label + "：", font=self.font).grid(row=i, column=0, sticky="w", pady=3)
+            v = tk.StringVar(value=val)
+            p_vars[key] = v
+            ttk.Entry(pf, textvariable=v, font=self.font, show=("●" if key == "password" else "")
+                      ).grid(row=i, column=1, sticky="ew", pady=3)
+
+        ttk.Label(win, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="占位符：{username} {password}。不知道自己学校的接口就点下面的\n"
+                       "「测试网页认证」：它会真实试一次，过程和结果写进主窗口的日志。").pack(
+            anchor="w", padx=14, pady=(10, 0))
+
+        def collect():
+            return {
+                "mode": mode_var.get(),
+                "url": p_vars["url"].get().strip(),
+                "method": (p_vars["method"].get().strip() or "post").lower(),
+                "body": p_vars["body"].get().strip(),
+                "script": p_vars["script"].get().strip(),
+                "username": p_vars["username"].get().strip(),
+                "password_enc": dpapi_encrypt(p_vars["password"].get()) if p_vars["password"].get() else "",
+                "probe_url": p_vars["probe_url"].get().strip(),
+                "preset": p.get("preset", ""),
+                "headers": p.get("headers") or {"Content-Type":
+                                                "application/x-www-form-urlencoded"},
+            }
+
+        def apply_preset(_event=None):
+            want = next((k for k, item in PORTAL_PRESETS.items()
+                         if item["label"] == preset_var.get()), None)
+            if not want:
+                return
+            merged, tip = apply_portal_preset({}, want)
+            mode_var.set(merged.get("mode") or "auto")
+            for key in ("url", "method", "body"):
+                if merged.get(key) is not None:
+                    p_vars[key].set(str(merged.get(key) or ""))
+            note.configure(text=tip)
+
+        preset_box.bind("<<ComboboxSelected>>", apply_preset)
+
+        def test_portal():
+            cfg_try = collect()
+            cfg_try["headers"] = {"Content-Type": "application/x-www-form-urlencoded"}
+            user = p_vars["username"].get().strip() or self.snap.get("account", "")
+            pwd = p_vars["password"].get() or self.snap.get("password", "")
+            self.log("— 测试网页（门户）认证，方式：%s —" % cfg_try["mode"], "warn")
+
+            def run():
+                from .net import portal_login, portal_probe
+                online, page = portal_probe(cfg_try.get("probe_url") or None)
+                if online:
+                    self.log("现在就能上网（没被门户拦住）—— 不需要认证，或者已经认证过了。", "ok")
+                    return
+                self.log("检测到门户登录页：%s" % (page or "(没拿到)"))
+                ok, msg = portal_login(cfg_try, user, pwd, lambda m: self.log(m))
+                self.log("网页认证测试：%s（%s）" % ("成功" if ok else "未成功", msg),
+                         "ok" if ok else "err")
+
+            threading.Thread(target=run, daemon=True).start()
+
+        ttk.Button(win, text="测试网页认证", command=test_portal).pack(anchor="w", padx=14, pady=(10, 0))
+
+        def save_close():
+            self.cfg["campus"]["portal"] = collect()
+            self.save()
+            self.log("网页（门户）认证设置已保存（有线和无线都会用这份）。", "ok")
+            win.destroy()
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=14, pady=12)
+        ttk.Button(bar, text="保存", command=save_close).pack(side="right")
+        ttk.Button(bar, text="取消", command=win.destroy).pack(side="right", padx=6)
+
+    def check_update(self):
+        """查询 GitHub 最新 Release，和本机版本比较。"""
+        def work():
+            import urllib.request
+            from . import __version__
+            url = ("https://api.github.com/repos/tanshaojie666/campusnet-assistant"
+                   "/releases/latest")
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "CampusNetAssistant"})
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=15) as resp:
+                    data = json.load(resp)
+                latest = (data.get("tag_name") or "").lstrip("vV")
+                if latest and latest != __version__:
+                    self.log("发现新版本：%s（当前 %s）→ %s"
+                             % (latest, __version__, data.get("html_url")), "warn")
+                else:
+                    self.log("已是最新版本（%s）。" % __version__, "ok")
+            except Exception as exc:  # noqa: BLE001
+                self.log("检查更新失败（多半是访问不了 GitHub）：%s" % exc, "warn")
+                self.log("可以手动看：https://github.com/tanshaojie666/campusnet-assistant/releases", "warn")
+
+        self.log("正在检查更新…")
+        threading.Thread(target=work, daemon=True).start()
+
     def check_now(self):
         self._refresh_status()
+
+    # ------------------------------------------------------- 登录自启
+    @staticmethod
+    def _startup_path():
+        return os.path.join(os.environ.get("APPDATA", ""),
+                            r"Microsoft\Windows\Start Menu\Programs\Startup\校园网助手.cmd")
+
+    def _startup_entry_exists(self):
+        return os.path.isfile(self._startup_path())
+
+    def toggle_autostart(self):
+        """在“启动”文件夹里放/删一个快捷启动脚本（登录后后台打开，无窗口）。"""
+        path = self._startup_path()
+        try:
+            if self.autostart_var.get():
+                import sys
+                exe = sys.executable or "python.exe"
+                if exe.lower().endswith("python.exe"):
+                    cand = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                    if os.path.isfile(cand):
+                        exe = cand
+                entry = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                     "CampusNetAssistant.pyw")
+                # 内容保持纯 ASCII：.cmd 里的中文可能被 cmd.exe 按其它代码页误解
+                body = ('@echo off\r\n'
+                        'rem CampusNetAssistant - start minimized after sign-in\r\n'
+                        'start "" "%s" "%s" --minimized\r\n' % (exe, entry))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="ascii", errors="replace", newline="") as fh:
+                    fh.write(body)
+                self.log("已开启：登录后会后台打开校园网助手（窗口收在托盘里）。", "ok")
+            else:
+                if os.path.isfile(path):
+                    os.remove(path)
+                self.log("已关闭登录自启。", "ok")
+        except Exception as exc:  # noqa: BLE001
+            self.log("设置登录自启失败：%s" % exc, "err")
+            try:
+                self.autostart_var.set(not self.autostart_var.get())
+            except Exception:
+                pass
 
     # ======================================================= 动作
     def collect_config(self):
