@@ -536,3 +536,15 @@ def json_load(path, default=None):
             return json.load(fh)
     except Exception:
         return default
+
+
+def system_uptime_seconds():
+    """系统已经运行了多少秒（用 GetTickCount64，不需要管理员权限）。
+
+    用来区分"刚开机启动"和"计划任务每 5 分钟的重启"：
+    前者要清掉上一次留下的「断开」状态（用户要的是开机照常连校园网）。
+    """
+    try:
+        return ctypes.windll.kernel32.GetTickCount64() / 1000.0
+    except Exception:
+        return 999999.0
