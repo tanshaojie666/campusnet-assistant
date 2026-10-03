@@ -61,12 +61,15 @@ def boot_mode():
 
     # 有线接入配置（PPPoE 之外的 DHCP / 静态 IP / 门户认证 / 学校客户端 / 802.1X）
     wired_cfg = dict(cfg.get("wired") or {})
-    portal_cfg = dict(wired_cfg.get("portal") or {})
+    # 门户认证：有线无线共用（旧版配置存在 wired.portal 里，这里做兼容）
+    portal_cfg = dict(cfg.get("portal") or wired_cfg.get("portal") or {})
     portal_user = portal_cfg.get("username") or account
     portal_pwd = dpapi_decrypt(portal_cfg.get("password_machine") or "", machine=True) \
         if portal_cfg.get("password_machine") else password
     if portal_pwd:
         portal_cfg["_password"] = portal_pwd        # 只放内存，不写回文件
+    portal_on = bool(portal_cfg.get("url") or portal_cfg.get("script")
+                     or portal_cfg.get("mode") == "auto")
     wires = wired_auth_list(wired_cfg, connection)
     if not wired_cfg.get("auth"):
         wired_cfg["auth"] = wires
@@ -207,8 +210,30 @@ def boot_mode():
                     sleep_interruptible(backoff, lambda: os.path.isfile(BOOT_STOP))
                     backoff = min(backoff * 2, 300)
                     continue
-            elif mode == "wireless":
-                boot_log("无线未连上（%s），%d 秒后重试" % (link_desc or "原因未知", backoff))
+            elif mode in ("wireless", "both"):
+                # 无线：连上了却不通 → 很可能是被门户拦住（校园 WiFi 常见）
+                from .net import portal_login, wifi_connected_ssid
+                got = wifi_connected_ssid()
+                if wifi_ssid and got and got.lower() == wifi_ssid.lower():
+                    if portal_on:
+                        boot_log("无线已连上但上不了网，尝试网页（门户）认证 …")
+                        ok3, msg3 = portal_login(portal_cfg, portal_user,
+                                                 portal_cfg.get("_password") or password, boot_log)
+                        boot_log("  " + str(msg3))
+                        time.sleep(3)
+                        link_cache["t"] = 0
+                        ok4, ip4, why4 = prober.check()
+                        boot_heartbeat(ok4, ip4, why4)
+                        if ok4:
+                            boot_log("门户认证后已联网（IP %s）" % (ip4 or "?"))
+                            fails, backoff = 0, interval
+                            continue
+                        boot_log("门户认证后仍不通；%d 秒后重试" % backoff)
+                    else:
+                        boot_log("无线已连上但探测不到网络；%d 秒后重试" % backoff)
+                else:
+                    boot_log("无线未连上（%s），%d 秒后重试"
+                             % (link_desc or ("当前：%s" % got if got else "原因未知"), backoff))
                 sleep_interruptible(backoff, lambda: os.path.isfile(BOOT_STOP))
                 backoff = min(backoff * 2, 300)
                 continue
