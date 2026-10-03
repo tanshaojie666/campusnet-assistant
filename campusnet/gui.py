@@ -1502,6 +1502,7 @@ class App:
         own_key = ""            # 本程序亲自开起来的客户端；只要它还活着就保持标记
         wait_until = 0.0        # 「跟着 VPN 走」时：等校园网断开再开代理的截止时间
         told_net = 0.0          # "正在试着连热点"这条日志的节流
+        alt_until = 0.0         # 等手机热点关联+拿地址的截止时间
         while not self.stop_event.is_set():
             try:
                 rules = load_rules(None)
@@ -1539,18 +1540,34 @@ class App:
                             ok_net, why = True, "未开启安全闸门"
                             if require_alt:
                                 ok_net, why = other_network_available(self.cfg, hotspot)
-                                if not ok_net and hotspot and time.time() - told_net > 120:
+                                if not ok_net and hotspot and time.time() - told_net > 60:
                                     told_net = time.time()
-                                    self.log("检测到 %s：翻墙要先有别的网，正在试着连「%s」…"
-                                             % (what, hotspot), "warn")
+                                    self.log("检测到 %s：翻墙要先有别的网，正在连「%s」并等它拿地址"
+                                             "（最多等 30 秒）…" % (what, hotspot), "warn")
                                     try:
                                         if hotspot in wifi_profiles():
+                                            # 不在这里 sleep（会把界面卡住）：
+                                            # 发起连接后交给下面的 tick 反复检查
                                             wifi_connect(hotspot)
-                                            time.sleep(6)
-                                    except Exception:
-                                        pass
-                                    ok_net, why = other_network_available(self.cfg, hotspot)
-                            if not ok_net:
+                                            alt_until = time.time() + 30
+                                        else:
+                                            self.log("提示：无线配置里没有「%s」这个热点。"
+                                                     "先用手机连一次、勾上「自动连接」，"
+                                                     "或把界面上填的热点名改成一致的。"
+                                                     % hotspot, "warn")
+                                    except Exception as exc:
+                                        self.log("连接热点出错：%s" % exc, "warn")
+                                if alt_until and not ok_net:
+                                    if time.time() < alt_until:
+                                        ok_net = None      # 等待中：校园网先不动，也不报"没有可用网络"
+                                        allowed = False
+                                    else:
+                                        alt_until = 0.0    # 等够了，按"没有可用网络"处理
+                                elif ok_net:
+                                    alt_until = 0.0
+                            if ok_net is None:
+                                pass                       # 正在等热点关联 + 拿地址
+                            elif not ok_net:
                                 # 没有替代网络 → 校园网不动、翻墙不开
                                 if time.time() - told > 180:
                                     told = time.time()

@@ -370,7 +370,6 @@ class TestRuntimeSignals(unittest.TestCase):
         """不能只看 schtasks 的退出码：普通权限下它会被拒绝 → 界面误报"守护没安装"。
 
         实测踩到过：守护明明在跑（心跳正常），界面却说没安装。
-        所以判断逻辑里必须有开机配置 / 心跳的兜底。
         """
         import inspect
         from campusnet import installer
@@ -379,6 +378,62 @@ class TestRuntimeSignals(unittest.TestCase):
         self.assertIn("BOOT_CONFIG", src)
         self.assertIn("heartbeat", src)
         self.assertIsInstance(installer.task_registered(), bool)
+
+    def test_wifi_connected_ssid_ignores_hosted_state(self):
+        """netsh 最后一行「承载网络状态 : 不可用」曾把"已连接"覆盖成"不可用" → 读成空。
+
+        后果很严重：热点明明连着，程序却认为没有可用网络 → 翻墙永远不生效。
+        """
+        from campusnet import net
+        fake = ("系统上有 1 个接口:\n\n    名称                   : WLAN\n"
+                "    状态                   : 已连接\n"
+                "    SSID                   : iPhone\n"
+                "    BSSID                  : e2:15:6c:26:0f:68\n"
+                "    配置文件               : iPhone \n\n"
+                "    承载网络状态  : 不可用\n")
+        orig = net.run_cmd
+        net.run_cmd = lambda *a, **k: (0, fake)
+        try:
+            self.assertEqual(net.wifi_connected_ssid(), "iPhone")
+        finally:
+            net.run_cmd = orig
+
+    def test_adapter_ip_and_gateway_exact_match(self):
+        """adapter_ip 必须精确匹配网卡名：以前 "WLAN" 会串到 "vEthernet (WLAN)"。
+
+        串号的后果：拿虚拟网卡的地址去探测 → 永远"上不了网" → 热点白连。
+        """
+        from campusnet import net
+        fake = ("以太网适配器 以太网:\n\n   媒体状态  . . . : 媒体已断开连接\n\n"
+                "无线局域网适配器 WLAN:\n\n   IPv4 地址 . . . : 172.20.10.4\n"
+                "   默认网关. . . . : 172.20.10.1\n\n"
+                "以太网适配器 vEthernet (WLAN):\n\n   IPv4 地址 . . . : 172.23.64.1\n")
+        orig = net.run_cmd
+        net.run_cmd = lambda *a, **k: (0, fake)
+        net._IPCONFIG_CACHE["blocks"] = {}
+        try:
+            self.assertEqual(net.adapter_ip("WLAN"), "172.20.10.4")
+            self.assertEqual(net.adapter_ip("vEthernet (WLAN)"), "172.23.64.1")
+            self.assertEqual(net.adapter_gateway("WLAN"), "172.20.10.1")
+        finally:
+            net.run_cmd = orig
+            net._IPCONFIG_CACHE["blocks"] = {}
+
+    def test_other_network_candidates_include_wifi(self):
+        """手机热点连着时，无线网卡必须算进"别的网络"候选（以前会整张漏掉）。"""
+        from campusnet import net
+        fns = (net.adapter_ip, net.wifi_connected_ssid, net.wifi_interfaces, net.wired_adapters)
+        net.wifi_interfaces = lambda: ["WLAN"]
+        net.wifi_connected_ssid = lambda: "iPhone"
+        net.adapter_ip = lambda n: "172.20.10.4" if n == "WLAN" else "172.25.240.1"
+        net.wired_adapters = lambda **k: []
+        try:
+            cands = net._other_network_candidates(
+                {"campus": {"mode": "wired", "wifi_ssid": "iPhone"}})
+            self.assertIn("172.20.10.4", [c[0] for c in cands])
+        finally:
+            (net.adapter_ip, net.wifi_connected_ssid,
+             net.wifi_interfaces, net.wired_adapters) = fns
 
     def test_require_other_network_default_on(self):
         """安全闸门默认必须是开的：没有替代网络就绝不能断校园网。

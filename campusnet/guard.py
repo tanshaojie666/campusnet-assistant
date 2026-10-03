@@ -656,6 +656,16 @@ def selftest(cfg) -> int:
     print("   无线 SSID 配置：", campus.get("wifi_ssid") or "（未配置）")
     print("   当前无线：", wifi_connected_ssid() or "未连接")
     print("   已保存无线配置：", len(wifi_profiles()), "个")
+    # 翻墙前的"替代网络"判断（热点没准备好时这里会明说，避免"翻墙莫名其妙不生效"）
+    gc = cfg.get("guard") or {}
+    if gc.get("follow_vpn") or gc.get("require_other_network", True):
+        from .net import other_network_available
+        hs = (gc.get("vpn_hotspot_ssid") or "").strip()
+        ok_alt, why_alt = other_network_available(cfg, hs)
+        print("   替代网络（翻墙前必须先有）：", ("有 - " if ok_alt else "没有 - ") + why_alt)
+        if hs:
+            saved = hs in wifi_profiles()
+            print("     手机热点：", hs, "｜已保存过该热点：", "是" if saved else "否（要先连一次）")
     print(line)
     print("2) 密码")
     from .config import get_password, portal_credentials

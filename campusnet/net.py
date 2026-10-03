@@ -201,43 +201,59 @@ def ppp_dns_servers(connection_name):
 # 无线
 # --------------------------------------------------------------------------
 def wifi_interfaces():
-    """返回无线网卡名列表。"""
+    """返回无线网卡名列表。
+
+    以 `netsh wlan show interfaces` 的"名称"为准 —— 它列出来的才是真正的无线网卡。
+    踩过的坑：以前用"名字里含 WLAN/无线 就猜"，
+    结果把虚拟网卡 `vEthernet (WLAN)` 也当成无线网卡（还解析出个 `(WLAN)`），
+    于是"无线网卡的 IP"取成了 Hyper-V 的地址，探测必然全失败。
+    """
     names = []
-    try:
-        import ctypes
-        import ctypes.wintypes as wt
-
-        class GUID(ctypes.Structure):
-            _fields_ = [("Data1", wt.DWORD), ("Data2", wt.WORD), ("Data3", wt.WORD),
-                        ("Data4", ctypes.c_byte * 8)]
-
-        class IP_ADAPTER_ADDRESSES(ctypes.Structure):
-            pass
-
-        # 简化：用 netsh 的接口名即可（避免复杂的 IP Helper 结构体）
-    except Exception:
-        pass
+    code, out = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=30)
+    if code == 0:
+        for line in out.splitlines():
+            m = re.match(r"^\s*(?:名称|Name)\s*[:：]\s*(.+?)\s*$", line, re.I)
+            if m:
+                nm = m.group(1).strip()
+                if nm and nm not in names:
+                    names.append(nm)
+    if names:
+        return names
+    # 兜底：从接口列表里猜，但排除虚拟网卡
     code, out = run_cmd(["netsh", "interface", "show", "interface"], timeout=30)
     for line in out.splitlines():
-        if "WLAN" in line or "无线" in line or "Wi-Fi" in line:
+        low = line.lower()
+        if "vethernet" in low or "hyper-v" in low:
+            continue
+        if "wlan" in low or "无线" in line or "wi-fi" in low:
             parts = line.split()
-            if parts:
+            if parts and parts[-1] not in names:
                 names.append(parts[-1])
     return names or ["WLAN"]
 
 
 def wifi_connected_ssid():
-    """当前连接的无线 SSID（未连接返回 ""）。"""
+    """当前连接的无线 SSID（未连接返回 ""）。
+
+    踩过的坑：netsh 输出的最后一行是「承载网络状态 : 不可用」，
+    它里面也有"状态"两个字，被旧解析器当成网卡状态，于是**明明连着热点却读成空**，
+    连带把"有没有别的网络"的候选网卡也漏掉了。所以这里：
+      · 只认**第一个**真正的 状态/State 行（接口状态在最前面）
+      · 跳过 承载网络/Hosted/Radio 这类行
+    """
     code, out = run_cmd(["netsh", "wlan", "show", "interfaces"], timeout=30)
     if code != 0:
         return ""
     ssid, state = "", ""
     for line in out.splitlines():
-        if re.search(r"^\s*(SSID)\s*:", line, re.I) and "BSSID" not in line.upper():
-            ssid = line.split(":", 1)[1].strip()
-        if re.search(r"(State|状态)\s*:", line) and "Radio" not in line:
-            state = line.split(":", 1)[1].strip().lower()
-    if ssid and ("connected" in state or "已连接" in state or state == ""):
+        low = line.lower()
+        if "承载" in line or "hosted" in low or "radio" in low:
+            continue                      # 这些不是"本机连没连上"
+        if not ssid and re.match(r"^\s*SSID\s*[:：]", line, re.I) and "BSSID" not in line.upper():
+            ssid = re.split(r"[:：]", line, maxsplit=1)[1].strip()
+        if not state and re.match(r"^\s*(State|状态)\s*[:：]", line, re.I):
+            state = re.split(r"[:：]", line, maxsplit=1)[1].strip().lower()
+    if ssid and (not state or "connected" in state or "已连接" in state):
         return ssid
     return ""
 
@@ -335,9 +351,42 @@ def tcp_probe(host, port, timeout=1.5, bind_ip=None):
                 pass
 
 
+def dns_probe(server, name="www.baidu.com", timeout=2.0, bind_ip=None):
+    """向 server 的 53 端口发一个最简 DNS 查询；收到**正常应答**返回 True。
+
+    用途：判断"手机热点能不能上网"。
+    往手机（也就是热点的网关）发查询，手机替我们去问外网 ——
+    因为目标就在**本地网段**，不受默认路由影响，
+    所以"校园网还连着、它抢着默认路由"的时候也能测准。
+    这一点很关键：直接 TCP 外网会被校园网那条默认路由吃掉，测出来永远是没网。
+    """
+    sock = None
+    try:
+        q = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+        for part in name.split("."):
+            q += bytes([len(part)]) + part.encode("ascii")
+        q += b"\x00\x00\x01\x00\x01"
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        if bind_ip:
+            sock.bind((bind_ip, 0))
+        sock.sendto(q, (server, 53))
+        data, _addr = sock.recvfrom(1024)
+        if len(data) < 12 or data[:2] != q[:2]:
+            return False
+        return (data[3] & 0x0F) != 2            # rcode=2 是 SERVFAIL，不算通
+    except Exception:
+        return False
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
 class Prober:
     """TCP 探测。ICMP 在很多校园网被封，所以不用 ping。"""
-
     def __init__(self, probes=None):
         self.probes = [tuple(p) for p in (probes or []) if len(p) == 2] or \
                       [tuple(p) for p in FALLBACK_PROBES]
@@ -422,7 +471,15 @@ def _other_network_candidates(cfg=None):
     except Exception:
         campus_ip = ""
     ssid = wifi_connected_ssid()
-    wifi_names = wifi_interfaces() if (ssid and ssid.lower() != campus_wifi) else []
+    # 无线网卡**总是**算候选，不再依赖 SSID 解析成功 ——
+    # 以前 SSID 读不出来时整张无线网卡会被漏掉，于是"手机热点明明连着却判定没有可用网络"。
+    # 只有当"校园网本身就是走这张无线"时才排除它（有线接入时怎么都不排除）。
+    wifi_used_by_campus = (campus.get("mode") or "").strip().lower() in ("wireless", "both")
+    wifi_names = []
+    for nm in wifi_interfaces():
+        if wifi_used_by_campus and campus_wifi and ssid and ssid.lower() == campus_wifi:
+            continue          # 这张无线就是校园网自己用的，不算"别的网络"
+        wifi_names.append(nm)
     names = list(wifi_names)
     try:
         names += [t[0] for t in wired_adapters(include_virtual=True)]
@@ -437,10 +494,10 @@ def _other_network_candidates(cfg=None):
         if not ip or ip == campus_ip or ip.startswith(("169.254.", "127.", "0.")):
             continue
         if name in wifi_names:
-            label = "无线「%s」" % ssid
+            label = "无线「%s」" % (ssid or name)
         else:
             label = "网卡「%s」" % name
-        out.append((ip, label))
+        out.append((ip, label, name))
     return out
 
 
@@ -461,23 +518,26 @@ def other_network_available(cfg=None, hotspot_ssid=""):
     cands = _other_network_candidates(cfg)
     if not cands:
         return False, "没发现别的网络（现在只有校园网）"
-    hosts = []
-    try:
-        conn = ((cfg or {}).get("campus") or {}).get("connection") or ""
-        for h in (ppp_dns_servers(conn) or []):
-            if h:
-                hosts.append((h, 53))
-    except Exception:
-        pass
-    hosts += [("223.5.5.5", 53), ("119.29.29.29", 53), ("180.76.76.76", 53)]
-    for ip, label in cands:
-        for host, port in hosts[:3]:
+    deadline = time.time() + 8.0          # 别把界面卡太久
+    tried = []
+    for ip, label, name in cands[:3]:
+        tried.append(label)
+        # ① 先问这个网络自己的网关（手机热点就是手机）：目标在本地网段，
+        #    不受校园网抢默认路由的影响；能拿到正常 DNS 应答，说明它是真能上网的。
+        gw = adapter_gateway(name)
+        if gw and time.time() < deadline:
+            if dns_probe(gw, timeout=1.6, bind_ip=ip):
+                return True, "%s 能上网（经手机/网关 %s 转发成功）" % (label, gw)
+        # ② 再补一刀 TCP 外网探测（公网优先：校园网内部 DNS 从热点根本够不到）
+        for host, port in (("223.5.5.5", 53), ("119.29.29.29", 53), ("223.5.5.5", 443)):
+            if time.time() > deadline:
+                break
             try:
-                if tcp_probe(host, port, timeout=1.6, bind_ip=ip):
+                if tcp_probe(host, port, timeout=1.2, bind_ip=ip):
                     return True, "%s 能上网（%s）" % (label, ip)
             except Exception:
                 continue
-    return False, "%s 都上不了网" % "、".join(l for _i, l in cands[:3])
+    return False, "%s 都上不了网" % "、".join(tried)
 
 
 def other_network_available_simple(cfg=None):
@@ -544,22 +604,69 @@ def pick_wired_adapter(wired_cfg=None):
     return cands[0][0] if cands else ""
 
 
+_ADAPTER_PREFIXES = ("以太网适配器", "无线局域网适配器", "PPP 适配器", "隧道适配器",
+                     "Ethernet adapter", "Wireless LAN adapter", "PPP adapter",
+                     "Tunnel adapter", "未知适配器", "Unknown adapter")
+_IPCONFIG_CACHE = {"t": 0.0, "blocks": {}}
+
+
+def _ipconfig_blocks(max_age=3.0):
+    """把 ipconfig 输出拆成 {网卡名: 该网卡的行列表}。
+
+    网卡名必须**精确**（去掉"以太网适配器/无线局域网适配器"这类前缀后的真正名字），
+    否则 "WLAN" 会串到 "vEthernet (WLAN)"、"以太网" 会串到 "vEthernet (以太网)" ——
+    这正是"热点明明连着却判定上不了网"的根源之一。
+    结果缓存 3 秒，避免一次判断里反复跑 ipconfig。
+    """
+    now = time.time()
+    if _IPCONFIG_CACHE["blocks"] and now - _IPCONFIG_CACHE["t"] < max_age:
+        return _IPCONFIG_CACHE["blocks"]
+    code, out = run_cmd(["ipconfig"], timeout=30)
+    blocks, cur = {}, None
+    for line in out.splitlines():
+        if line.strip() and not line[:1].isspace():
+            head = line.rstrip()
+            if not re.search(r"[:：]\s*$", head):
+                cur = None
+                continue
+            nm = re.sub(r"[:：]\s*$", "", head).strip()
+            for pre in _ADAPTER_PREFIXES:
+                if nm.startswith(pre):
+                    nm = nm[len(pre):].strip()
+                    break
+            cur = nm or None
+            if cur is not None:
+                blocks.setdefault(cur, [])
+            continue
+        if cur is not None:
+            blocks[cur].append(line)
+    _IPCONFIG_CACHE["t"] = now
+    _IPCONFIG_CACHE["blocks"] = blocks
+    return blocks
+
+
 def adapter_ip(name):
     """某个网卡当前的 IPv4（取不到返回 ""）。"""
     if not name:
         return ""
-    code, out = run_cmd(["ipconfig"], timeout=30)
-    inside = False
-    for line in out.splitlines():
-        if line.strip() and not line[:1].isspace():
-            inside = name in line
-            continue
-        if inside:
+    for line in _ipconfig_blocks().get(name.strip(), []):
+        m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", line)
+        if m:
+            ip = m.group(1)
+            if ip != "0.0.0.0" and not ip.startswith("255."):
+                return ip
+    return ""
+
+
+def adapter_gateway(name):
+    """某个网卡的默认网关（取不到返回 ""）。判断"手机热点有没有流量"要用它。"""
+    if not name:
+        return ""
+    for line in _ipconfig_blocks().get(name.strip(), []):
+        if re.search(r"(默认网关|Default Gateway)", line, re.I):
             m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", line)
             if m:
-                ip = m.group(1)
-                if ip != "0.0.0.0" and not ip.startswith("255."):
-                    return ip
+                return m.group(1)
     return ""
 
 
