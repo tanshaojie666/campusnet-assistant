@@ -13,18 +13,23 @@ import os
 import time
 
 from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
-                     boot_heartbeat, boot_log, heartbeat_state, load_boot_config,
-                     load_rules, pause_active)
+                     boot_heartbeat, boot_log, flip_active, heartbeat_state,
+                     load_boot_config, load_rules, pause_active)
 from .clients import scan_clients
 from .net import (adapter_ip, apply_wifi_policy, campus_link_state, friendly_error,
                   pppoe_connections, ppp_state, ppp_state_cached, ras_dial, ras_hangup,
                   wifi_connected_ssid, wifi_profiles, wired_adapters, wired_auth_list,
-                  wired_authenticate)
+                  wired_authenticate, wired_bind_ip)
 from .net import build_prober
 from .rules import kill_processes
 from .util import named_mutex, sleep_interruptible
 
 MODE_LABEL = {"wired": "有线", "wireless": "无线", "both": "有线+无线"}
+
+# 校园网刚连上后的多少秒内，仍然关掉代理/VPN（这段时间代理可能干扰认证、抢路由）。
+# 超过这段时间就**不再反复关** —— 否则"翻墙模式"刚开起来的代理会立刻被自己杀掉，
+# 表现就是"打开 Google 也翻不了墙"。
+KILL_WINDOW = 90
 
 
 def _script_mtime():
@@ -78,6 +83,8 @@ def boot_mode():
     link_cache = {}
     fails, backoff = 0, interval
     last_wifi = 0.0
+    link_started = 0.0            # 校园网链路是什么时候连上的（用于 KILL_WINDOW 判断）
+    flip_logged = False           # 「翻墙模式在用代理」这条日志只记一次，避免刷屏
     mtime = _script_mtime()
 
     boot_log("===== 系统级守护启动：接入方式=%s 拨号连接=%s 有线方式=%s 无线=%s =====" %
@@ -117,12 +124,35 @@ def boot_mode():
             link_up, link_desc = campus_link_state(mode, connection, wifi_ssid, link_cache,
                                                    wired_cfg)
 
-            # 校园网一连上，就关掉代理/VPN（链路级判断，代理软件没法伪造）
-            if kill_on and link_up:
+            # 校园网一连上就关掉代理/VPN（链路级判断，代理软件没法伪造）。
+            # 但有两种情况必须让路：
+            #   1) 翻墙模式正在用代理（flip.active 标记是新的）—— 不能杀掉它刚开的代理；
+            #   2) 链路已经稳定超过 KILL_WINDOW —— 认证早就完成了，此后新开的代理
+            #      不会影响校园网，再反复杀就成了"翻墙永远打不开"。
+            if link_up:
+                if not link_started:
+                    link_started = time.time()
+            else:
+                link_started = 0.0
+                flip_logged = False
+
+            flip_on, flip_client, _flip_note, _flip_age = flip_active(cfg)
+            fresh_link = bool(link_up and link_started
+                              and (time.time() - link_started) <= KILL_WINDOW)
+
+            if kill_on and link_up and flip_on:
+                if not flip_logged:
+                    boot_log("翻墙模式正在使用代理（%s），本次不关闭 —— 避免把它刚开起来的代理杀掉。"
+                             % (flip_client or "未知"))
+                    flip_logged = True
+            elif kill_on and fresh_link:
                 acted, detail = kill_processes(processes, boot_log)
                 if acted:
-                    boot_log("校园网已连上，" + detail)
+                    boot_log("校园网刚连上，" + detail)
                     link_cache["t"] = 0
+                    boot_heartbeat(False, "", "刚连上校园网，已关闭代理/VPN", campus=link_desc)
+            elif not link_up:
+                flip_logged = False
 
             ppp_up, ppp_ip = (False, "")
             if mode in ("wired", "both") and connection and "pppoe" in wires:
