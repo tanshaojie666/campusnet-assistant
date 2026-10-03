@@ -251,6 +251,46 @@ class TestRulesCompat(unittest.TestCase):
         self.assertEqual(C.load_rules(None)["processes"], ["flclash.exe"])
 
 
+class TestPortalShared(unittest.TestCase):
+    """门户认证配置：有线和无线共用一份，且兼容旧位置 campus.wired.portal。"""
+
+    def tearDown(self):
+        C.save_config({})
+
+    def test_new_location(self):
+        C.save_config({"campus": {"portal": {"mode": "template", "url": "http://new/login"}}})
+        cfg = C.load_config()
+        self.assertEqual(C.campus_portal(cfg)["url"], "http://new/login")
+
+    def test_legacy_fallback(self):
+        C.save_config({"campus": {"wired": {"portal": {"mode": "auto", "url": "http://old/login"}}}})
+        cfg = C.load_config()
+        self.assertEqual(C.campus_portal(cfg)["url"], "http://old/login")
+        self.assertEqual(C.campus_portal(cfg)["mode"], "auto")
+
+    def test_new_location_wins_when_set(self):
+        C.save_config({"campus": {"portal": {"url": "http://new/login"},
+                                  "wired": {"portal": {"url": "http://old/login"}}}})
+        cfg = C.load_config()
+        self.assertEqual(C.campus_portal(cfg)["url"], "http://new/login")
+
+    def test_credentials_fall_back_to_campus_account(self):
+        cfg = C.load_config()
+        C.set_account(cfg, "2620", "pw")
+        user, pwd = C.portal_credentials(cfg)
+        self.assertEqual(user, "2620")
+        self.assertEqual(pwd, "pw")
+
+    def test_portal_credentials_override(self):
+        cfg = C.load_config()
+        C.set_account(cfg, "2620", "pw")
+        cfg["campus"]["portal"] = {"username": "other"}
+        cfg["campus"]["portal"]["password_enc"] = cfg["campus"]["password_enc"]
+        user, pwd = C.portal_credentials(cfg)
+        self.assertEqual(user, "other")
+        self.assertEqual(pwd, "pw")
+
+
 class TestBootConfig(unittest.TestCase):
     """系统级配置构建：密码必须是机器范围加密、且不含用户范围密文。"""
 
