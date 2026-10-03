@@ -1243,8 +1243,15 @@ class App:
                     ras_hangup(s["connection"])
                     code, text = ras_dial(s["connection"], s["account"], s["password"])
                     if code != 0:
-                        from .net import friendly_error
-                        self.log("拨号失败 → " + friendly_error(code, text), "err")
+                        from .net import disabled_wired_adapters, friendly_error
+                        if code == 756 and disabled_wired_adapters():
+                            # 网卡被禁用时界面自己拨不动（守护才恢复得了），
+                            # 这里给个明确提示，别让人以为程序坏了
+                            self.log("有线网卡当前是禁用状态，界面拨不了 —— "
+                                     "系统级守护会在 15 秒内把它启用并拨号，稍等一下即可。",
+                                     "warn")
+                        else:
+                            self.log("拨号失败 → " + friendly_error(code, text), "err")
                     else:
                         self.log("拨号成功。", "ok")
                 elif any(a in auths for a in ("dhcp", "static", "portal", "client", "lan", "restart")):

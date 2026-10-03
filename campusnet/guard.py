@@ -14,9 +14,9 @@ import time
 
 from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
                      boot_heartbeat, boot_log, clear_disabled_adapter, clear_disconnect,
-                     clear_pause, disconnect_requested, flip_active, get_disabled_adapter,
-                     get_network_choice, heartbeat_state, load_boot_config, load_rules,
-                     pause_active, set_disabled_adapter)
+                     clear_pause, disabled_adapter_path, disconnect_requested, flip_active,
+                     get_disabled_adapter, get_network_choice, heartbeat_state,
+                     load_boot_config, load_rules, pause_active, set_disabled_adapter)
 from .clients import scan_clients
 from .net import (adapter_ip, apply_wifi_policy, campus_link_state, clear_stale_dials,
                   friendly_error, pppoe_connections, ppp_state, ppp_state_cached,
@@ -177,8 +177,19 @@ def boot_mode():
                     if not adapter:
                         from .net import pick_wired_adapter
                         adapter = pick_wired_adapter(wired_cfg)
-                    if adapter and set_adapter_disabled(adapter, True):
+                    if adapter:
+                        # 先记下"要禁用哪块"，再动手禁用 ——
+                        # 顺序反过来的话，记录写失败就会留下"一块被禁用的网卡 + 没有记录"
+                        # 的状态，那是最难查的组合（守护会靠扫描兜底，但仍先记更稳）。
                         set_disabled_adapter(adapter, cfg)
+                        recorded = get_disabled_adapter(cfg)
+                        disabled_ok = set_adapter_disabled(adapter, True)
+                    else:
+                        recorded, disabled_ok = "", False
+                    if adapter and disabled_ok:
+                        if not recorded:
+                            boot_log("警告：没能记录被禁用的网卡（%s），"
+                                     "不过守护会靠扫描恢复它。" % disabled_adapter_path(cfg))
                         boot_log("rasdial 没断掉（链路 %s 仍在）→ 已禁用有线网卡「%s」，"
                                  "校园网必定断开；手机热点/无线不受影响。"
                                  "点「立即连接」会自动重新启用它。" % (ip or "?", adapter))
@@ -190,16 +201,26 @@ def boot_mode():
                 link_started = 0.0
                 boot_heartbeat(False, "", "已按请求断开校园网")
 
-            # 「立即连接」后把上次断开时禁用的网卡恢复回来
+            # 「立即连接」后把上次断开时禁用的网卡恢复回来。
+            # 这里**不依赖"禁用了哪块"的记录**：记录一旦丢失，网卡就会一直禁用，
+            # 拨号一直报 756，校园网再也连不回来（实测踩到过）。
+            # 所以直接扫一遍：只要有被禁用的物理有线网卡，就启用它们。
             if (not pause_active(pause_file, cfg)) and mode in ("wired", "both"):
-                from .net import adapter_enabled, pick_wired_adapter
+                from .net import adapter_enabled, enable_disabled_wired_adapters, \
+                    pick_wired_adapter
                 ad = get_disabled_adapter(cfg) or wired_cfg.get("adapter") \
                     or pick_wired_adapter(wired_cfg)
                 if ad and not adapter_enabled(ad):
                     if set_adapter_disabled(ad, False):
-                        clear_disabled_adapter(cfg)
                         boot_log("检测到有线网卡「%s」被禁用（上次断开留下的）→ 已重新启用。"
                                  % ad)
+                        clear_disabled_adapter(cfg)
+                        time.sleep(6)
+                        link_cache["t"] = 0
+                else:
+                    extra = enable_disabled_wired_adapters(boot_log)
+                    if extra:
+                        clear_disabled_adapter(cfg)
                         time.sleep(6)
                         link_cache["t"] = 0
 

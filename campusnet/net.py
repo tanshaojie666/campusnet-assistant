@@ -546,6 +546,31 @@ def adapter_enabled(name):
     return True
 
 
+def disabled_wired_adapters():
+    """当前处于"已禁用"状态的**物理**有线网卡名字列表。
+
+    用途：为了断开校园网而被禁用的网卡，我们必须能恢复回来。
+    如果"禁用了哪块"的记录丢了（实测发生过），就靠它兜底 ——
+    否则会出现：网卡一直禁用 → 拨号一直报 756 → 校园网再也连不回来。
+    """
+    out = []
+    for nm, admin, _state in wired_adapters():
+        if not ("已启用" in admin or "Enabled" in admin):
+            out.append(nm)
+    return out
+
+
+def enable_disabled_wired_adapters(log=None):
+    """把所有被禁用的物理有线网卡重新启用，返回启用的名字列表。"""
+    done = []
+    for nm in disabled_wired_adapters():
+        if set_adapter_disabled(nm, False):
+            done.append(nm)
+            if log:
+                log("已重新启用有线网卡「%s」" % nm)
+    return done
+
+
 def restart_adapter(name):
     """重新启用网卡（拔插网线的软件等价操作），需要管理员权限。"""
     if not name:
