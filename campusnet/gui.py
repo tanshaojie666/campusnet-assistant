@@ -76,7 +76,8 @@ class App:
         self._build_campus(self.tab_campus)
         self._build_flip(self.tab_flip)
 
-        self.tray = TrayIcon("校园网助手（双击打开）", lambda fn: self.root.after(0, fn),
+        self.tray = TrayIcon("校园网助手（单击打开，右键菜单）",
+                             lambda fn: self.root.after(0, fn),
                              self.show_window, self.check_now, self.quit_app)
         self.tray_ok = self.tray.add()
 
@@ -780,6 +781,20 @@ class App:
                     state = "normal" if payload else "disabled"
                     self.btn_connect.configure(state=state)
         except queue.Empty:
+            pass
+        # 托盘动作：窗口过程只登记动作，真正的 Tk 调用必须在这里（Tk 线程）执行。
+        # 在窗口过程里调用 Tk（例如 root.after）会触发 Python 3.14 的
+        # Fatal Python error，进程当场死掉、pythonw 下还没有任何提示 ——
+        # 用户看到的就是"点托盘图标没反应"。
+        try:
+            for action in self.tray.poll():
+                if action == "show":
+                    self.show_window()
+                elif action == "check":
+                    self.check_now()
+                elif action == "quit":
+                    self.quit_app()
+        except Exception:
             pass
         self.root.after(150, self._pump)
 

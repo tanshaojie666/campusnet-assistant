@@ -380,6 +380,38 @@ class TestRuntimeSignals(unittest.TestCase):
         self.assertIn("heartbeat", src)
         self.assertIsInstance(installer.task_registered(), bool)
 
+    def test_tray_wnd_proc_never_calls_tk(self):
+        """托盘窗口过程里**绝不能**调用 Tk。
+
+        实测（Python 3.14）：在 ctypes 窗口过程里调用 root.after() 会直接触发
+        `Fatal Python error: PyEval_RestoreThread ... thread state is NULL`，
+        进程当场死掉；用 pythonw 启动时还看不到任何提示 ——
+        用户看到的就是"点托盘图标没反应"（就是它）。
+        正确做法：窗口过程只登记动作，由界面线程轮询 poll() 执行。
+        """
+        from campusnet.util import (TrayIcon, WM_TRAY, WM_LBUTTONUP, WM_LBUTTONDBLCLK,
+                                    WM_RBUTTONUP)
+        touched = []
+        tray = TrayIcon("测试",
+                        lambda fn: touched.append("schedule"),   # 绝不该被调用
+                        lambda: touched.append("show"),
+                        lambda: touched.append("check"),
+                        lambda: touched.append("quit"))
+
+        tray._wnd_proc(0, WM_TRAY, 1, WM_LBUTTONUP)          # 单击左键
+        self.assertEqual(tray.poll(), ["show"])
+        tray._wnd_proc(0, WM_TRAY, 1, WM_LBUTTONDBLCLK)      # 双击左键
+        self.assertEqual(tray.poll(), ["show"])
+
+        # 右键走菜单：把菜单替换掉，验证命令是被"登记"而不是直接执行
+        tray._menu = lambda hwnd: "quit"
+        tray._wnd_proc(0, WM_TRAY, 1, WM_RBUTTONUP)
+        self.assertEqual(tray.poll(), ["quit"])
+
+        # 关键断言：全程没有触碰任何 Tk 回调
+        self.assertEqual(touched, [])
+        self.assertEqual(tray.poll(), [])                    # 取过一次就空了
+
     def test_network_choice_lifecycle(self):
         """手动切换网络的选择：切走要记住（自动逻辑让路），切回要清掉。"""
         self.assertEqual(C.get_network_choice(), "")

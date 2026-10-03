@@ -288,7 +288,121 @@ def _gui_check():
 
 check("界面构建 + 回调 + 变量", _gui_check)
 
-# ---------------------------------------------------------------- 9 命令行
+# ---------------------------------------------------------------- 9 托盘（端到端）
+print("\n【9】托盘图标：点它能不能回到主界面（端到端实测）")
+_tray_out = {}
+
+
+def _tray_check():
+    """真建一个 App，把窗口收起来，然后**真的发托盘消息**，看窗口能不能回来。
+
+    这就是用户反馈的那个 bug（点托盘图标 / 右键都没反应）的现场复现。
+    """
+    import ctypes
+    import tkinter as tk
+    from campusnet.gui import App
+    from campusnet.util import (TrayIcon, WM_TRAY, WM_LBUTTONUP, WM_LBUTTONDBLCLK,
+                                WM_RBUTTONUP, IDM_SHOW, IDM_CHECK)  # noqa: F401
+    root = tk.Tk()
+    root.geometry("300x200")
+    app = App(root, C.load_config())
+
+    def pump(seconds):
+        """按**真实时间**空转 update()。
+
+        不能用 40 次 update() 代替 1 秒：界面的轮询是 after(150) 定时器，
+        要真实时间过去才会触发，否则会误判成"点了没反应"。
+        """
+        import time as _t
+        t0 = _t.time()
+        while _t.time() - t0 < seconds:
+            root.update()
+            _t.sleep(0.02)
+
+    pump(1.0)
+    _tray_out["tray_ok"] = app.tray_ok
+    _tray_out["hwnd"] = bool(app.tray.hwnd)
+
+    # 模拟"用户把它收进托盘"
+    root.withdraw()
+    pump(0.5)
+    _tray_out["hidden_viewable"] = bool(root.winfo_viewable())
+
+    u = ctypes.windll.user32
+    u.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+                               ctypes.c_void_p]
+
+    # ① 单击左键 → 应该回到主界面
+    u.PostMessageW(app.tray.hwnd, WM_TRAY, 1, WM_LBUTTONUP)
+    pump(1.2)
+    _tray_out["single_click"] = bool(root.winfo_viewable())
+
+    # ② 再收起来，双击左键 → 也应该回来
+    root.withdraw()
+    pump(0.5)
+    u.PostMessageW(app.tray.hwnd, WM_TRAY, 1, WM_LBUTTONDBLCLK)
+    pump(1.2)
+    _tray_out["double_click"] = bool(root.winfo_viewable())
+
+    # ③ 右键 → 菜单逻辑被派发；选中"显示主界面"后窗口要能回来
+    #    （真的弹菜单会让检查卡住，所以把 _menu 换成"模拟用户选了显示主界面"）
+    root.withdraw()
+    pump(0.5)
+    real_menu = app.tray._menu
+    app.tray._menu = lambda hwnd: "show"
+    try:
+        u.PostMessageW(app.tray.hwnd, WM_TRAY, 1, WM_RBUTTONUP)
+        pump(1.2)
+    finally:
+        app.tray._menu = real_menu
+    _tray_out["right_click"] = bool(root.winfo_viewable())
+
+    # ④ 菜单真的能建起来 + 能数出菜单项（右键菜单用的那套调用）
+    try:
+        m = u.CreatePopupMenu()
+        u.AppendMenuW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t,
+                                  ctypes.c_wchar_p]
+        u.AppendMenuW(m, 0x0, IDM_SHOW, "显示主界面")
+        u.AppendMenuW(m, 0x0, IDM_CHECK, "立即检查")
+        u.GetMenuItemCount.argtypes = [ctypes.c_void_p]
+        _tray_out["menu_items"] = u.GetMenuItemCount(m)
+        u.DestroyMenu(m)
+    except Exception as exc:  # noqa: BLE001
+        _tray_out["menu_items"] = "异常 %s" % exc
+
+    _tray_out["icon_handle"] = bool(app.tray.hicon)
+    app.closing = True
+    try:
+        app.tray.remove()
+    except Exception:
+        pass
+    root.destroy()
+    return ("图标=%s 图标句柄=%s | 收起后可见=%s | 单击左键回来=%s | "
+            "双击回来=%s | 右键选显示回来=%s | 菜单项=%s" % (
+                _tray_out.get("tray_ok"), _tray_out.get("icon_handle"),
+                _tray_out.get("hidden_viewable"), _tray_out.get("single_click"),
+                _tray_out.get("double_click"), _tray_out.get("right_click"),
+                _tray_out.get("menu_items")))
+
+
+_old_home2 = os.environ.get("CNA_HOME")
+os.environ["CNA_HOME"] = os.path.join(_tmp, "tray")
+os.environ["CNA_BOOT_DIR"] = os.path.join(_tmp, "tray", "boot")
+check("托盘：单击/双击/右键 端到端", _tray_check)
+if _old_home2:
+    os.environ["CNA_HOME"] = _old_home2
+else:
+    os.environ.pop("CNA_HOME", None)
+check("托盘：点一下就能回到主界面（用户反馈的那个 bug）",
+      lambda: need(_tray_out.get("single_click") is True,
+                   "单击左键已能唤回主界面" if _tray_out.get("single_click")
+                   else "单击左键**仍然**唤不回主界面"))
+check("托盘：右键菜单能唤回主界面",
+      lambda: need(_tray_out.get("right_click") is True,
+                   "右键菜单可用" if _tray_out.get("right_click")
+                   else "右键**仍然**唤不回主界面"))
+
+# ---------------------------------------------------------------- 10 命令行
 print("\n【9】命令行入口（只跑不修改的）")
 import subprocess  # noqa: E402
 

@@ -2,6 +2,46 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)（主版本.次版本.修订号）。
 
+## [1.10.3] — 修「点托盘图标没反应」（真因：点一下就崩）
+
+### 修复：点右下角托盘图标（左键 / 右键）没反应
+用户反馈"点托盘图标进不去主界面，右击也不行"。查下来是**两个叠加的问题**：
+
+1. **只认"双击"，不认"单击"**
+   窗口过程里只处理 `WM_LBUTTONDBLCLK`，用户习惯性**单击**左键就是毫无反应。
+   → 现在 `WM_LBUTTONUP` 和 `WM_LBUTTONDBLCLK` 都会打开主界面。
+
+2. **【真正的元凶】在窗口过程里调用了 Tk，导致点击时进程当场崩溃**
+   托盘窗口过程里原本用 `root.after(0, fn)` 把回调丢给界面线程。
+   实测（Python 3.14）这会直接触发：
+
+   ```
+   Fatal Python error: PyEval_RestoreThread: the function must be called with
+   the GIL held, ... but the GIL is released (the current Python thread state is NULL)
+   ```
+
+   **进程立刻死掉**；而程序是用 `pythonw` 启动的，死了也不会有任何提示，
+   用户看到的就是"点了没反应"（甚至连托盘图标一起消失）。
+   → 现在窗口过程**只登记动作**（纯 Python + 锁，线程安全），
+     由界面线程每 150 毫秒轮询 `poll()` 后在 Tk 线程里执行；
+     右键菜单仍然在窗口过程里弹（纯 Win32 调用，不碰 Tk）。
+
+   顺带：图标改用 `ExtractIconW` 正确提取（会显示真实程序图标），
+   并给用到的 user32/shell32 调用都补上了 `argtypes`。
+
+### 验证方式（可复现）
+`scripts/feature_check.py` 里新增**端到端托盘检查**：真的建一个界面、收进托盘、
+真的往托盘窗口 `PostMessage` 单击/双击/右键消息，然后断言窗口能不能回来 ——
+修复前这个检查会**直接把检查进程崩掉**，修复后：
+
+```
+图标=True 图标句柄=True | 收起后可见=False | 单击左键回来=True |
+双击回来=True | 右键选显示回来=True | 菜单项=2
+```
+
+### 其它
+- 单元测试增加到 **59 个**（新增"窗口过程绝不允许调用 Tk"的回归测试）。
+
 ## [1.10.2] — 全功能检查（88 项）+ 修一个"守护状态误报"的 bug
 
 ### 新增：`scripts/feature_check.py`（全功能检查）

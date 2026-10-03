@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 CREATE_NO_WINDOW = 0x08000000
@@ -354,9 +355,11 @@ def clear_all_user_proxies():
 # 右下角托盘图标（纯 ctypes）
 # --------------------------------------------------------------------------
 WM_TRAY = 0x8000 + 1
-NIM_ADD, NIM_DELETE = 0, 2
+NIM_ADD, NIM_DELETE, NIM_SETVERSION = 0, 2, 4
+NOTIFYICON_VERSION_4 = 4
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
-WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x0203, 0x0205
+WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x0202, 0x0203, 0x0205
+WM_CONTEXTMENU = 0x007B      # 有些系统（NOTIFYICON_VERSION_4）右键发这个
 TPM_RETURNCMD, TPM_RIGHTBUTTON = 0x0100, 0x0002
 MF_STRING, MF_SEPARATOR = 0x0, 0x800
 IDM_SHOW, IDM_CHECK, IDM_QUIT = 1001, 1002, 1003
@@ -388,13 +391,23 @@ class NOTIFYICONDATAW(ctypes.Structure):
 
 
 class TrayIcon:
-    """托盘图标：双击=显示主界面，右键=菜单（显示 / 立即检查 / 退出）。
+    """托盘图标：单击/双击=显示主界面，右键=菜单（显示 / 立即检查 / 退出）。
+
+    ⚠️ 重要设计：**窗口过程里绝对不能碰 Tk**。
+    实测（Python 3.14）：在 ctypes 的窗口过程里调用 `root.after()` 会直接
+    触发 `Fatal Python error: PyEval_RestoreThread ... thread state is NULL`
+    —— 进程当场死掉，而且用 pythonw 启动时没有任何提示，
+    用户看到的就是"点托盘图标毫无反应"。
+
+    所以这里窗口过程只做两件事：登记动作（纯 Python，线程安全），
+    或者弹 Win32 菜单（纯 API，不碰 Tk）；
+    真正的 Tk 调用由界面线程轮询 poll() 来执行。
 
     add() 返回 False 时表示系统不允许创建（例如受限环境），调用方应退化为
     “隐藏窗口 + 靠快捷方式唤回”。
     """
 
-    def __init__(self, tooltip, schedule, on_show, on_check, on_quit):
+    def __init__(self, tooltip, schedule=None, on_show=None, on_check=None, on_quit=None):
         self.tooltip = tooltip
         self.schedule = schedule
         self.on_show = on_show
@@ -406,20 +419,41 @@ class TrayIcon:
         self._proc_ref = None
         self._class = "CampusNetAssistantTrayWnd"
         self._uid = 1
+        self._pending = []            # 待界面线程执行的动作
+        self._lock_pending = threading.Lock()
 
-    def _fire(self, cb):
+    # ------------------------------------------------ 线程安全的小信箱
+    def _post(self, action):
+        """登记一个要做的动作（只动 Python 列表，可以在窗口过程里安全调用）。"""
         try:
-            self.schedule(cb)
+            with self._lock_pending:
+                self._pending.append(action)
         except Exception:
             pass
+
+    def poll(self):
+        """界面线程调用：取走待执行的动作列表。"""
+        try:
+            with self._lock_pending:
+                out, self._pending = self._pending, []
+            return out
+        except Exception:
+            return []
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         try:
             if msg == WM_TRAY:
-                if lparam == WM_LBUTTONDBLCLK:
-                    self._fire(self.on_show)
-                elif lparam == WM_RBUTTONUP:
-                    self._menu(hwnd)
+                # 托盘回调里 lparam 的低位才是"发生了什么事"，
+                # 有的系统会把坐标/图标 ID 塞在高位，所以先取低位。
+                ev = int(lparam) & 0xFFFF
+                # 单击左键**和**双击左键都要能打开主界面 ——
+                # 以前只认双击，用户习惯性单击就是"点了没反应"。
+                if ev in (WM_LBUTTONUP, WM_LBUTTONDBLCLK):
+                    self._post("show")
+                elif ev in (WM_RBUTTONUP, WM_CONTEXTMENU):
+                    cmd = self._menu(hwnd)          # 纯 Win32，不碰 Tk
+                    if cmd:
+                        self._post(cmd)
         except Exception:
             pass
         try:
@@ -431,26 +465,47 @@ class TrayIcon:
             return 0
 
     def _menu(self, hwnd):
+        """弹出右键菜单，返回用户选的命令（没选返回 0）。整个函数不碰 Tk。"""
         u = ctypes.windll.user32
         u.CreatePopupMenu.restype = wintypes.HMENU
+        u.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t,
+                                  wintypes.LPCWSTR]
+        u.AppendMenuW.restype = wintypes.BOOL
+        u.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                     ctypes.c_void_p]
         u.TrackPopupMenu.restype = ctypes.c_int
+        u.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u.SetForegroundWindow.restype = wintypes.BOOL
+        u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                   wintypes.LPARAM]
+        u.PostMessageW.restype = wintypes.BOOL
+        u.DestroyMenu.argtypes = [wintypes.HMENU]
+        u.DestroyMenu.restype = wintypes.BOOL
+        cmd = 0
         menu = u.CreatePopupMenu()
-        u.AppendMenuW(menu, MF_STRING, IDM_SHOW, "显示主界面")
-        u.AppendMenuW(menu, MF_STRING, IDM_CHECK, "立即检查")
-        u.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        u.AppendMenuW(menu, MF_STRING, IDM_QUIT, "退出程序")
-        pt = wintypes.POINT()
-        u.GetCursorPos(ctypes.byref(pt))
-        u.SetForegroundWindow(hwnd)
-        cmd = u.TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None)
-        u.PostMessageW(hwnd, 0x0000, 0, 0)
-        u.DestroyMenu(menu)
+        try:
+            u.AppendMenuW(menu, MF_STRING, IDM_SHOW, "显示主界面")
+            u.AppendMenuW(menu, MF_STRING, IDM_CHECK, "立即检查")
+            u.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+            u.AppendMenuW(menu, MF_STRING, IDM_QUIT, "退出程序")
+            pt = wintypes.POINT()
+            u.GetCursorPos(ctypes.byref(pt))
+            # SetForegroundWindow 是必须的：否则菜单会一闪就没（经典坑）
+            u.SetForegroundWindow(hwnd)
+            cmd = u.TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                   pt.x, pt.y, 0, hwnd, None)
+            u.PostMessageW(hwnd, 0x0000, 0, 0)       # WM_NULL，收尾
+        finally:
+            if menu:
+                u.DestroyMenu(menu)
         if cmd == IDM_SHOW:
-            self._fire(self.on_show)
-        elif cmd == IDM_CHECK:
-            self._fire(self.on_check)
-        elif cmd == IDM_QUIT:
-            self._fire(self.on_quit)
+            return "show"
+        if cmd == IDM_CHECK:
+            return "check"
+        if cmd == IDM_QUIT:
+            return "quit"
+        return 0
 
     def _data(self):
         nid = NOTIFYICONDATAW()
@@ -489,15 +544,25 @@ class TrayIcon:
             if not self.hwnd:
                 return False
             shell32 = ctypes.windll.shell32
+            # 同样要声明 argtypes：ExtractIconW 不声明时传字符串会抛异常，
+            # 就只能退回系统默认图标（以前的图标是"通用空白图标"就是这个原因）。
+            shell32.ExtractIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
+                                             wintypes.UINT]
             shell32.ExtractIconW.restype = wintypes.HICON
+            shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
+                                                  ctypes.POINTER(NOTIFYICONDATAW)]
+            shell32.Shell_NotifyIconW.restype = wintypes.BOOL
             try:
                 self.hicon = shell32.ExtractIconW(None, sys.executable, 0)
             except Exception:
                 self.hicon = None
             if not self.hicon:
                 u.LoadIconW.restype = wintypes.HICON
-                self.hicon = u.LoadIconW(None, ctypes.c_void_p(32512))
-            shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+                u.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+                try:
+                    self.hicon = u.LoadIconW(None, ctypes.c_wchar_p(32512))
+                except Exception:
+                    self.hicon = None
             self.added = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._data())))
             return self.added
         except Exception:
