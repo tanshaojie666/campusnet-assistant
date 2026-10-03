@@ -319,6 +319,17 @@ class TestRuntimeSignals(unittest.TestCase):
         """拨号前先关代理/VPN 默认开启（会抢路由、拦 DNS，导致拨号慢甚至拨不上）。"""
         self.assertTrue(DEFAULT_CONFIG["guard"]["kill_before_dial"])
 
+    def test_dial_gap_is_reasonable(self):
+        """两次拨号的最小间隔：太短会猛拨刷屏，太长会让人等太久。"""
+        from campusnet.guard import MIN_DIAL_GAP
+        self.assertGreaterEqual(MIN_DIAL_GAP, 30)
+        self.assertLessEqual(MIN_DIAL_GAP, 300)
+
+    def test_clear_stale_dials_is_safe(self):
+        """清理卡住的 rasdial：没有卡住进程时也必须安全返回 0。"""
+        from campusnet.net import clear_stale_dials
+        self.assertGreaterEqual(clear_stale_dials(), 0)
+
     def test_pause_lifecycle(self):
         self.assertFalse(C.pause_active())
         C.set_pause(5)

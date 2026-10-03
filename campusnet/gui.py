@@ -1217,9 +1217,14 @@ class App:
             self.log("保存失败：%s" % exc, "err")
 
     def connect(self, force=False):
-        """立即连接：先取消"先别拨"暂停与断开请求，再开始拨号。"""
+        """立即连接：取消"先别拨"暂停、断开请求和手动切换选择，然后开始拨号。"""
         clear_pause()
         clear_disconnect()
+        try:
+            from .config import clear_network_choice
+            clear_network_choice()          # 点了"立即连接"就是明确要校园网
+        except Exception:
+            pass
         if self.busy:
             return
         self.busy = True

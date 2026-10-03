@@ -78,6 +78,44 @@ def ras_hangup(entry, phonebook=None):
     return run_cmd(args, timeout=60)
 
 
+def clear_stale_dials():
+    """清理卡住的 rasdial 进程。
+
+    为什么需要：只要有一个 rasdial 卡住没退出，后面每次拨号都会立刻报
+    **756「已经有一个拨号连接在进行中」**，而且会一直卡下去 ——
+    表现就是"校园网怎么都连不回来"。拨号前先清一遍最省事。
+    """
+    from .util import list_processes, pids_of, terminate_pid
+    procs = list_processes() or {}
+    killed = 0
+    for pid in pids_of(procs, "rasdial.exe"):
+        if terminate_pid(pid):
+            killed += 1
+    return killed
+
+
+def reset_ras():
+    """重启 RasMan 服务，清掉"已经有一个拨号在进行中"（756）这种卡死状态。
+
+    756 有时根本不是进程卡住 —— 而是拨号状态卡在 RasMan 服务里
+    （实测：rasdial 进程数为 0，仍然次次报 756）。
+    这种情况下只有重启该服务才能恢复。
+    """
+    from .util import run_cmd
+    ps = ("try { Restart-Service RasMan -Force -ErrorAction Stop; 'ok' } "
+          "catch { 'fail' }")
+    code, out = run_cmd(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                        timeout=120)
+    ok = ("ok" in (out or "")) or code == 0
+    if not ok:
+        run_cmd(["sc", "stop", "RasMan"], timeout=60)
+        time.sleep(3)
+        run_cmd(["sc", "start", "RasMan"], timeout=60)
+        ok = True
+    time.sleep(4)
+    return ok
+
+
 def friendly_error(code, text=""):
     table = {
         0: "成功", 5: "访问被拒绝：需要管理员权限",

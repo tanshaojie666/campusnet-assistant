@@ -18,10 +18,11 @@ from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
                      get_network_choice, heartbeat_state, load_boot_config, load_rules,
                      pause_active, set_disabled_adapter)
 from .clients import scan_clients
-from .net import (adapter_ip, apply_wifi_policy, campus_link_state, friendly_error,
-                  pppoe_connections, ppp_state, ppp_state_cached, ras_dial, ras_hangup,
-                  set_adapter_disabled, wifi_connected_ssid, wifi_profiles, wired_adapters,
-                  wired_auth_list, wired_authenticate, wired_bind_ip)
+from .net import (adapter_ip, apply_wifi_policy, campus_link_state, clear_stale_dials,
+                  friendly_error, pppoe_connections, ppp_state, ppp_state_cached,
+                  ras_dial, ras_hangup, reset_ras, set_adapter_disabled,
+                  wifi_connected_ssid, wifi_profiles, wired_adapters, wired_auth_list,
+                  wired_authenticate, wired_bind_ip)
 from .net import build_prober
 from .rules import kill_processes
 from .util import list_processes, named_mutex, pids_of, sleep_interruptible
@@ -32,6 +33,10 @@ MODE_LABEL = {"wired": "有线", "wireless": "无线", "both": "有线+无线"}
 # 超过这段时间就**不再反复关** —— 否则"翻墙模式"刚开起来的代理会立刻被自己杀掉，
 # 表现就是"打开 Google 也翻不了墙"。
 KILL_WINDOW = 90
+
+# 两次拨号之间至少隔这么久（秒）。防止"拨号返回成功但探测不到网络"时
+# 每 15 秒猛拨一次 —— 既刷日志，也可能撞上学校的并发限制。
+MIN_DIAL_GAP = 60
 
 
 def _script_mtime():
@@ -94,6 +99,9 @@ def boot_mode():
         reconnect_after = 180
     wait_proxy_logged = False
     procs_snapshot = {}
+    err756 = 0                      # 连续 756 的次数（用来判断要不要重启 RasMan）
+    last_dial_ts = 0.0              # 上次拨号的时间（两次之间至少隔 MIN_DIAL_GAP 秒）
+    last_missing_log = 0.0          # "用着别的网但校园网没连上"这条日志的节流
     link_started = 0.0            # 校园网链路是什么时候连上的（用于 KILL_WINDOW 判断）
     flip_logged = False           # 「翻墙模式在用代理」这条日志只记一次，避免刷屏
     mtime = _script_mtime()
@@ -290,8 +298,11 @@ def boot_mode():
                 reconnect_no_flip and connection and "pppoe" in wires
                 and not ppp_up and not pause_active(pause_file, cfg))
             if campus_missing and ok:
-                boot_log("检测到正在使用别的网络（%s），但校园网没连上 → 仍按设置去拨校园网。"
-                         % (why or "其他网络"))
+                # 这条日志要节流：热点上会一直成立，否则每轮都刷一行
+                if time.time() - last_missing_log > 300:
+                    last_missing_log = time.time()
+                    boot_log("检测到正在使用别的网络（%s），但校园网没连上 → 仍按设置去拨校园网。"
+                             % (why or "其他网络"))
                 ok = False
 
             boot_heartbeat(ok, ip, why, campus=link_desc)
@@ -316,15 +327,28 @@ def boot_mode():
                 sleep_interruptible(interval, lambda: os.path.isfile(BOOT_STOP))
                 continue
 
+            # 两次拨号之间至少隔 MIN_DIAL_GAP 秒：
+            # 否则"拨号返回成功但探测不到网络"这种情况会让它每 15 秒猛拨一次，
+            # 既刷日志也可能触发学校的风控。
+            if time.time() - last_dial_ts < MIN_DIAL_GAP:
+                sleep_interruptible(interval, lambda: os.path.isfile(BOOT_STOP))
+                continue
+            last_dial_ts = time.time()
+
             # ---- 接入 ----
-            if mode == "wireless" or (mode == "both" and not ppp_up and wifi_ssid):
+            # 用户手动切走时（wifi / none），**不要**再自作主张连校园网 ——
+            # 否则"全部断开"之后一没网就会被他自动拨回来。
+            manual_off = get_network_choice(cfg) in ("wifi", "none")
+
+            if not manual_off and (mode == "wireless"
+                                   or (mode == "both" and not ppp_up and wifi_ssid)):
                 from .net import wifi_connect, wifi_connected_ssid
                 if wifi_ssid and wifi_connected_ssid().lower() != wifi_ssid.lower():
                     boot_log("正在连接无线 %s …" % wifi_ssid)
                     wifi_connect(wifi_ssid)
                     time.sleep(8)
 
-            use_pppoe = ("pppoe" in wires) and bool(connection)
+            use_pppoe = ("pppoe" in wires) and bool(connection) and not manual_off
             if mode in ("wired", "both") and use_pppoe:
                 boot_log("检测到校园网没连上，准备拨号…")
                 # 先干掉代理/VPN：它们会抢路由、拦 DNS，导致拨号慢甚至拨不上。
@@ -337,6 +361,11 @@ def boot_mode():
                                  % (time.time() - t_kill, detail))
                         sleep_interruptible(2, lambda: os.path.isfile(BOOT_STOP))
                 ras_hangup(connection, phonebook)
+                # 清掉卡住的 rasdial，否则本次拨号会立刻报 756 而失败
+                stale = clear_stale_dials()
+                if stale:
+                    boot_log("清理了 %d 个卡住的 rasdial 进程（否则会报 756）。" % stale)
+                    sleep_interruptible(2, lambda: os.path.isfile(BOOT_STOP))
                 code, text = ras_dial(connection, account, password, phonebook)
                 if code == 0:
                     # 不再死等固定 5 秒：PPP 一拿到地址就立刻继续（通常 1~2 秒）
@@ -355,9 +384,25 @@ def boot_mode():
                         boot_log("拨号成功，已联网（IP %s，用时 %.1f 秒）"
                                  % (ip2 or "?", time.time() - t_dial))
                         fails, backoff = 0, interval
+                        err756 = 0                      # 成功了就把 756 计数清零
                     else:
                         boot_log("拨号返回成功，但还探测不到网络。")
                 else:
+                    # 756（已经在拨号中）通常是暂时的：别按指数退避等下去，尽快重试。
+                    # 如果连续好几次都是 756，说明拨号状态卡在 RasMan 服务里了
+                    # （实测 rasdial 进程数为 0 也会一直报），此时重启该服务来清。
+                    if code == 756:
+                        backoff = 20
+                        err756 += 1
+                        if err756 >= 3:
+                            boot_log("连续 %d 次 756（拨号状态卡在 RasMan）→ 重启 RasMan 服务清状态。"
+                                     % err756)
+                            reset_ras()
+                            err756 = 0
+                            link_cache["t"] = 0
+                            continue
+                    else:
+                        err756 = 0
                     boot_log("拨号失败 → %s；%d 秒后重试" % (friendly_error(code, text), backoff))
                     sleep_interruptible(backoff, lambda: os.path.isfile(BOOT_STOP))
                     backoff = min(backoff * 2, 300)
