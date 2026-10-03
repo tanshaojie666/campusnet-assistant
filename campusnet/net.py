@@ -14,6 +14,9 @@ import os
 import re
 import socket
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from .util import run_cmd
 
@@ -331,10 +334,13 @@ def build_prober(cfg_campus, connection_name):
 # --------------------------------------------------------------------------
 # 统一判定
 # --------------------------------------------------------------------------
-def campus_link_state(mode, connection="", wifi_ssid="", cache=None):
+def campus_link_state(mode, connection="", wifi_ssid="", cache=None, wired_cfg=None):
     """校园网链路是否已连上（wired / wireless / both）。
 
-    返回 (是否连上, 说明)。cache 用于避免每轮都起 PowerShell。
+    wired 的判断依据由 wired_cfg.auth 决定：
+      · 配了 PPPoE（connection + auth 里有 pppoe）→ 以拨号链路为准
+      · 否则（dhcp / static / portal / client / lan）→ 以有线网卡是否拿到可用地址为准
+    这样插到别的路由器上不会被误判成"连上校园网"。
     """
     now = time.time()
     if cache is not None and cache.get("t") and now - cache["t"] < 10:
@@ -344,19 +350,454 @@ def campus_link_state(mode, connection="", wifi_ssid="", cache=None):
     want_wired = mode in ("wired", "both")
     want_wifi = mode in ("wireless", "both")
 
-    if want_wired and connection:
-        ok, ip = ppp_state(connection)
-        if ok:
-            up, desc = True, "有线已连接(%s)" % ip
-        elif mode == "wired":
-            desc = "有线未连接"
+    if want_wired:
+        up, desc = wired_link_state(wired_cfg or {}, connection, cache)
     if not up and want_wifi and wifi_ssid:
         got = wifi_connected_ssid()
         if got and got.lower() == wifi_ssid.lower():
             up, desc = True, "无线已连接(%s)" % got
         elif mode == "wireless":
             desc = "无线未连接%s" % ("（当前：%s）" % got if got else "")
+    if mode in ("wired", "wireless") and not desc:
+        desc = "有线未连接" if mode == "wired" else "无线未连接"
 
     if cache is not None:
         cache.update({"t": now, "up": up, "desc": desc})
     return up, desc
+
+
+# ==========================================================================
+# 有线接入：除了 PPPoE 拨号，还支持 DHCP / 静态 IP / 门户认证 / 专用客户端 / 802.1X
+# ==========================================================================
+def wired_auth_list(wired_cfg, connection=""):
+    """取有线认证方式列表；没配就按有没有拨号连接推断。"""
+    auths = [str(a).lower() for a in ((wired_cfg or {}).get("auth") or [])]
+    if not auths:
+        auths = ["pppoe"] if connection else ["dhcp"]
+    return auths
+
+
+# 虚拟网卡/隧道设备的关键字：它们长得像有线网卡，但不是插网线的那块
+VIRTUAL_ADAPTER_HINTS = (
+    "vethernet", "virtual", "vmware", "virtualbox", "hyper-v", "loopback", "bluetooth",
+    "tap-", "tap_", "wsl", "npcap", "teredo", "isatap", "6to4", "wi-fi direct",
+    "microsoft wi-fi", "pseudo", "tunnel", "隧道",
+)
+
+
+def wired_adapters(include_virtual=False):
+    """本机有线网卡 [(名字, 管理状态, 连接状态), ...]，已连接/已启用的排在前面。"""
+    out_list = []
+    code, out = run_cmd(["netsh", "interface", "show", "interface"], timeout=30)
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        admin, state, typ = parts[0], parts[1], parts[2]
+        name = " ".join(parts[3:])
+        low = name.lower()
+        if not include_virtual and any(k in low for k in VIRTUAL_ADAPTER_HINTS):
+            continue
+        wired = any(k in typ for k in ("Dedicated", "专用")) or \
+            any(k in name for k in ("以太网", "Ethernet", "本地连接", "Local Area"))
+        if not wired or "WLAN" in name:
+            continue
+        out_list.append((name, admin, state))
+
+    def _rank(item):
+        _nm, admin, state = item
+        enabled = ("已启用" in admin or "Enabled" in admin)
+        connected = ("已连接" in state or "Connected" in state)
+        return (0 if (enabled and connected) else 1 if enabled else 2)
+
+    out_list.sort(key=_rank)
+    return out_list
+
+
+def pick_wired_adapter(wired_cfg=None):
+    """选一块有线网卡：配置里指定了就用它，否则挑"已启用且已连接"的第一块。"""
+    name = (wired_cfg or {}).get("adapter") or ""
+    if name:
+        return name
+    for nm, admin, state in wired_adapters():
+        enabled = ("已启用" in admin or "Enabled" in admin)
+        connected = ("已连接" in state or "Connected" in state)
+        if enabled and connected:
+            return nm
+    cands = wired_adapters()
+    return cands[0][0] if cands else ""
+
+
+def adapter_ip(name):
+    """某个网卡当前的 IPv4（取不到返回 ""）。"""
+    if not name:
+        return ""
+    code, out = run_cmd(["ipconfig"], timeout=30)
+    inside = False
+    for line in out.splitlines():
+        if line.strip() and not line[:1].isspace():
+            inside = name in line
+            continue
+        if inside:
+            m = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", line)
+            if m:
+                ip = m.group(1)
+                if ip != "0.0.0.0" and not ip.startswith("255."):
+                    return ip
+    return ""
+
+
+def adapter_state(name):
+    """(是否启用, 是否已连接)。"""
+    for nm, admin, state in wired_adapters():
+        if nm == name:
+            return ("已启用" in admin or "Enabled" in admin), ("已连接" in state or "Connected" in state)
+    return True, False
+
+
+def set_adapter_dhcp(name, dns_auto=True):
+    """设为自动获取 IP（DHCP）。"""
+    ok = run_cmd(["netsh", "interface", "ipv4", "set", "address",
+                  "name=%s" % name, "source=dhcp"], timeout=60)[0] == 0
+    if dns_auto:
+        run_cmd(["netsh", "interface", "ipv4", "set", "dnsservers",
+                 "name=%s" % name, "source=dhcp"], timeout=60)
+    return ok
+
+
+def set_adapter_static(name, address, mask="255.255.255.0", gateway="", dns=None):
+    """设为静态 IP。"""
+    if not address:
+        return False
+    args = ["netsh", "interface", "ipv4", "set", "address", "name=%s" % name,
+            "static", address, mask]
+    if gateway:
+        args.append(gateway)
+    ok = run_cmd(args, timeout=60)[0] == 0
+    dns = [d for d in (dns or []) if d]
+    if dns:
+        run_cmd(["netsh", "interface", "ipv4", "set", "dnsservers", "name=%s" % name,
+                 "static", dns[0], "primary"], timeout=60)
+        for i, server in enumerate(dns[1:], start=2):
+            run_cmd(["netsh", "interface", "ipv4", "add", "dnsservers", "name=%s" % name,
+                     server, "index=%d" % i], timeout=60)
+    return ok
+
+
+def restart_adapter(name):
+    """重新启用网卡（拔插网线的软件等价操作），需要管理员权限。"""
+    if not name:
+        return False
+    run_cmd(["netsh", "interface", "set", "interface", "name=%s" % name, "admin=disable"],
+            timeout=60)
+    time.sleep(3)
+    ok = run_cmd(["netsh", "interface", "set", "interface", "name=%s" % name, "admin=enable"],
+                 timeout=60)[0] == 0
+    return ok
+
+
+# --------------------------------------------------------------------------
+# 门户认证（Captive Portal）
+# --------------------------------------------------------------------------
+# 这些地址会返回 204（无内容）。被门户劫持时，会返回 302 跳到登录页。
+PORTAL_PROBE_URLS = [
+    "http://connect.rom.miui.com/generate_204",
+    "http://www.gstatic.com/generate_204",
+    "http://connectivitycheck.platform.hicloud.com/generate_204",
+]
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+def _opener():
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def portal_probe(url=None, timeout=6):
+    """探测是否被门户劫持。
+
+    返回 (是否已放行, 门户地址)：
+      · 收到 204            → 已放行，门户地址为空
+      · 收到 30x 且有跳转    → 未放行，返回跳转地址（= 登录页）
+    """
+    for probe in ([url] if url else PORTAL_PROBE_URLS):
+        try:
+            req = urllib.request.Request(probe, headers={"User-Agent": "Mozilla/5.0"})
+            with _opener().open(req, timeout=timeout) as resp:
+                if resp.status in (204, 200):
+                    body = ""
+                    try:
+                        body = resp.read(2048).decode("utf-8", "replace")
+                    except Exception:
+                        pass
+                    if resp.status == 204 or len(body) < 16:
+                        return True, ""
+                    return False, probe          # 200 但有内容 → 多半被门户替换了
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                return False, exc.headers.get("Location", "") or probe
+            continue
+        except Exception:
+            continue
+    return False, ""
+
+
+def fill_template(text, username, password):
+    """把模板里的占位符换成账号密码。"""
+    out = text or ""
+    for key in ("{username}", "{user}", "{account}", "{学号}", "{name}"):
+        out = out.replace(key, username or "")
+    for key in ("{password}", "{pass}", "{pwd}", "{密码}"):
+        out = out.replace(key, password or "")
+    return out
+
+
+def parse_login_form(html):
+    """从登录页里找出第一个含密码框的表单 → (action, method, {字段: 值})。"""
+    for m in re.finditer(r"<form\b([^>]*)>(.*?)</form>", html or "", re.I | re.S):
+        attrs, body = m.group(1), m.group(2)
+        has_pwd, fields = False, {}
+        for im in re.finditer(r"<input\b([^>]*)>", body, re.I):
+            a = im.group(1)
+            nm = re.search(r'name\s*=\s*["\']?([^"\'\s>]+)', a, re.I)
+            if not nm:
+                continue
+            val = re.search(r'value\s*=\s*["\']([^"\']*)["\']', a, re.I)
+            typ = re.search(r'type\s*=\s*["\']?([^"\'\s>]+)', a, re.I)
+            fields[nm.group(1)] = val.group(1) if val else ""
+            if typ and typ.group(1).lower() == "password":
+                has_pwd = True
+        if has_pwd and fields:
+            act = re.search(r'action\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+            meth = re.search(r'method\s*=\s*["\']([^"\']*)["\']', attrs, re.I)
+            return (act.group(1) if act else ""), \
+                (meth.group(1).lower() if meth else "post"), fields
+    return "", "", {}
+
+
+def portal_login(portal_cfg, username, password, log=None):
+    """门户认证，三种方式：
+
+      auto     —— 自动打开登录页、找出表单、填账号密码并提交（适合简单的门户）
+      template —— 用自己填的请求模板提交（适合深信服 / 锐捷 / Dr.COM 这类）
+      script   —— 直接跑一条命令（学校给了脚本或命令行工具时最省事）
+
+    返回 (是否成功, 说明)。
+    """
+    def _log(msg):
+        if log:
+            log(msg)
+
+    portal_cfg = portal_cfg or {}
+    mode = str(portal_cfg.get("mode") or "auto").lower()
+
+    online, page = portal_probe(portal_cfg.get("probe_url") or None)
+    if online:
+        return True, "门户已放行（探测通过）"
+    if not page:
+        page = portal_cfg.get("url") or ""
+    _log("  检测到门户登录页：%s" % (page or "(没拿到)"))
+
+    if mode == "script":
+        cmd = portal_cfg.get("script") or ""
+        if not cmd:
+            return False, "没有配置脚本"
+        cmd = fill_template(cmd, username, password)
+        _log("  执行脚本：%s" % cmd[:80])
+        code, out = run_cmd(cmd, timeout=120) if isinstance(cmd, str) else (1, "脚本格式不对")
+        _log("  脚本退出码 %s %s" % (code, (out or "")[:120]))
+        ok, _ = portal_probe(portal_cfg.get("probe_url") or None)
+        return ok, ("脚本执行完毕，门户已放行" if ok else "脚本执行了但门户没放行")
+
+    if mode == "template":
+        url = portal_cfg.get("url") or page
+        method = str(portal_cfg.get("method") or "post").lower()
+        body = fill_template(portal_cfg.get("body") or
+                             "username={username}&password={password}", username, password)
+        headers = portal_cfg.get("headers") or {"Content-Type":
+                                                "application/x-www-form-urlencoded"}
+        if not url:
+            return False, "没有配置门户地址"
+        try:
+            if method == "get":
+                req = urllib.request.Request(url + ("&" if "?" in url else "?") + body,
+                                             headers=headers)
+            else:
+                req = urllib.request.Request(url, data=body.encode("utf-8"), headers=headers)
+            with _opener().open(req, timeout=20) as resp:
+                text = resp.read(4096).decode("utf-8", "replace")
+            _log("  门户返回：%s" % text[:120].replace("\n", " "))
+        except Exception as exc:  # noqa: BLE001
+            _log("  门户请求出错：%s" % exc)
+            return False, "门户请求失败：%s" % exc
+        time.sleep(2)
+        ok, _ = portal_probe(portal_cfg.get("probe_url") or None)
+        return ok, ("门户认证成功" if ok else "提交了，但还没放行（检查字段名/地址）")
+
+    # ---- auto：自动填表 ----
+    try:
+        req = urllib.request.Request(page, headers={"User-Agent": "Mozilla/5.0"})
+        with _opener().open(req, timeout=20) as resp:
+            html = resp.read(200000).decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001
+        return False, "打不开登录页：%s" % exc
+    action, method, fields = parse_login_form(html)
+    if not fields:
+        return False, "登录页里没找到可填的表单（多半是 JS 动态生成，请改用 template 或 script）"
+    action = action or page
+    if action.startswith("/") and page:
+        base = urllib.parse.urlsplit(page)
+        action = "%s://%s%s" % (base.scheme, base.netloc, action)
+    for name in list(fields):
+        low = name.lower()
+        if any(k in low for k in ("user", "name", "account", "login", "学号", "账号")):
+            if "pass" not in low:
+                fields[name] = username or fields[name]
+        elif any(k in low for k in ("pass", "pwd", "密码")):
+            fields[name] = password or fields[name]
+        elif low in ("0", "1", "domain", "domainname"):
+            fields[name] = fields[name]
+    _log("  表单字段：%s" % "、".join(fields.keys()))
+    body = urllib.parse.urlencode(fields)
+    try:
+        if method == "get":
+            url = action + ("&" if "?" in action else "?") + body
+            with _opener().open(url, timeout=20) as resp:
+                resp.read(4096)
+        else:
+            req = urllib.request.Request(action, data=body.encode("utf-8"),
+                                         headers={"Content-Type":
+                                                  "application/x-www-form-urlencoded",
+                                                  "User-Agent": "Mozilla/5.0"})
+            with _opener().open(req, timeout=20) as resp:
+                resp.read(4096)
+    except Exception as exc:  # noqa: BLE001
+        _log("  提交表单出错：%s" % exc)
+        return False, "提交失败：%s" % exc
+    time.sleep(2)
+    ok, _ = portal_probe(portal_cfg.get("probe_url") or None)
+    return ok, ("自动填表认证成功" if ok else "自动提交了，但还没放行（多半需要 template/script）")
+
+
+# --------------------------------------------------------------------------
+# 802.1X（有线）
+# --------------------------------------------------------------------------
+def lan_8021x_interfaces():
+    code, out = run_cmd(["netsh", "lan", "show", "interfaces"], timeout=30)
+    conn = "已连接" in out or "Connected" in out or "已身份验证" in out
+    return conn, out
+
+
+def lan_8021x_connect(profile, interface=""):
+    """连接一个已保存的有线 802.1X 配置（配置需要先在系统里建好）。"""
+    if not profile:
+        return False, "没有配置 802.1X 配置名"
+    args = ["netsh", "lan", "connect", "name=%s" % profile]
+    if interface:
+        args.append("interface=%s" % interface)
+    code, out = run_cmd(args, timeout=90)
+    return code == 0, out
+
+
+# --------------------------------------------------------------------------
+# 有线接入总流程（非 PPPoE 部分）
+# --------------------------------------------------------------------------
+def wired_authenticate(wired_cfg, connection, username, password, log=None):
+    """按配置依次执行：网卡/DHCP/静态IP → 门户认证 → 学校客户端 → 802.1X。
+
+    PPPoE 由上层单独处理（它需要账号密码且有专门的错误码）。
+    返回 (是否已连上, 说明)。
+    """
+    def _log(msg):
+        if log:
+            log(msg)
+
+    wired_cfg = wired_cfg or {}
+    auths = wired_auth_list(wired_cfg, connection)
+    adapter = pick_wired_adapter(wired_cfg)
+    if adapter:
+        _log("  有线网卡：%s" % adapter)
+
+    if "dhcp" in auths:
+        ip = adapter_ip(adapter) if adapter else ""
+        if not ip or ip.startswith("169.254."):
+            _log("  设置为自动获取 IP（DHCP）…")
+            set_adapter_dhcp(adapter)
+            time.sleep(6)
+        else:
+            _log("  已自动获取地址：%s" % ip)
+
+    if "static" in auths:
+        st = wired_cfg.get("static") or {}
+        if st.get("address"):
+            cur = adapter_ip(adapter) if adapter else ""
+            if cur != st.get("address"):
+                _log("  设置静态 IP %s …" % st.get("address"))
+                set_adapter_static(adapter, st.get("address"), st.get("mask") or "255.255.255.0",
+                                   st.get("gateway") or "", st.get("dns") or [])
+                time.sleep(4)
+
+    if "restart" in auths and adapter:
+        _log("  重新启用网卡（相当于拔插网线）…")
+        restart_adapter(adapter)
+        time.sleep(8)
+
+    if "client" in auths:
+        exe = wired_cfg.get("client_exe") or ""
+        if exe and os.path.isfile(exe):
+            from .util import create_no_window_flag, list_processes
+            name = os.path.basename(exe).lower()
+            if not (list_processes() or {}).get(name):
+                _log("  启动学校认证客户端：%s" % os.path.basename(exe))
+                import subprocess
+                try:
+                    subprocess.Popen([exe], close_fds=True,
+                                     creationflags=create_no_window_flag())
+                except Exception as exc:  # noqa: BLE001
+                    _log("  客户端启动失败：%s" % exc)
+                time.sleep(10)
+        elif exe:
+            _log("  找不到学校客户端：%s" % exe)
+
+    if "lan" in auths:
+        profile = wired_cfg.get("lan_profile") or ""
+        ok, out = lan_8021x_connect(profile, adapter)
+        _log("  802.1X 连接%s" % ("已发起" if ok else "失败"))
+        time.sleep(6)
+
+    if "portal" in auths:
+        _log("  进行门户认证 …")
+        ok, msg = portal_login(wired_cfg.get("portal") or {}, username, password, _log)
+        _log("  " + msg)
+        if ok:
+            return True, msg
+
+    up, desc = wired_link_state(wired_cfg, connection)
+    return up, desc
+
+
+def wired_bind_ip(wired_cfg):
+    """有线网卡当前 IP —— 用来把探测钉在这条线路上，避免别的网络造成误判。"""
+    adapter = pick_wired_adapter(wired_cfg)
+    ip = adapter_ip(adapter) if adapter else ""
+    return "" if ip.startswith("169.254.") else ip
+
+
+def wired_link_state(wired_cfg, connection="", cache=None):
+    """有线链路状态（PPPoE 以拨号链路为准，其余以网卡地址为准）。"""
+    wired_cfg = wired_cfg or {}
+    auths = wired_auth_list(wired_cfg, connection)
+
+    if connection and "pppoe" in auths:
+        up, ip = ppp_state_cached(connection, cache if cache is not None else {})
+        return (True, "有线PPPoE已连接(%s)" % ip) if up else (False, "有线PPPoE未连接")
+
+    adapter = pick_wired_adapter(wired_cfg)
+    ip = adapter_ip(adapter) if adapter else ""
+    if ip and not ip.startswith("169.254."):
+        return True, "有线已获取地址(%s %s)" % (adapter, ip)
+    return False, "有线未获取地址%s" % ("（%s）" % adapter if adapter else "")
+
