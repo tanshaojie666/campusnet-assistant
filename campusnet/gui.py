@@ -19,9 +19,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import config as C
 from .clients import client_by_id, client_installed, scan_clients
-from .config import (APP_TITLE, HOME_DIR, LOG_FILE, heartbeat_state,
-                     load_config, load_rules, save_config, save_rules,
-                     set_account, set_pause)
+from .config import (APP_TITLE, CONFIG_FILE, HOME_DIR, LOG_FILE, clear_flip_active,
+                     heartbeat_state, load_config, load_rules, save_config, save_rules,
+                     set_account, set_flip_active, set_pause)
 from .guard import boot_task_registered
 from .installer import install_boot, uninstall_boot
 from .net import (build_prober, campus_link_state, pppoe_connections, ppp_state,
@@ -235,8 +235,20 @@ class App:
     # ======================================================= 翻墙页
     def _build_flip(self, f):
         self.flip_var = tk.BooleanVar(value=bool(self.cfg["flip"].get("enabled")))
-        ttk.Checkbutton(f, text="启用翻墙模式：**没连校园网**时，打开指定程序才自动开代理并切到可用节点",
+        ttk.Checkbutton(f, text="启用翻墙模式：打开指定程序时，自动开代理并切到可用的目标地区节点",
                         variable=self.flip_var).pack(anchor="w")
+
+        self.flip_when_var = tk.StringVar(value=self.cfg["flip"].get("when") or "off_campus")
+        when_row = ttk.Frame(f)
+        when_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(when_row, text="什么时候翻墙：", font=self.font).pack(side="left")
+        ttk.Radiobutton(when_row, text="只在没连校园网时", value="off_campus",
+                        variable=self.flip_when_var).pack(side="left", padx=(4, 12))
+        ttk.Radiobutton(when_row, text="任何时候（连着校园网也翻墙）", value="always",
+                        variable=self.flip_when_var).pack(side="left")
+        ttk.Label(f, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="选「任何时候」时：校园网认证完成后才开代理，开代理期间系统级守护不会来关它。"
+                  ).pack(anchor="w", pady=(2, 0))
 
         cl = ttk.LabelFrame(f, text=" 翻墙客户端（勾选允许使用的；列表顺序 = 尝试顺序） ", padding=12)
         cl.pack(fill="both", expand=True, pady=(10, 0))
@@ -278,8 +290,15 @@ class App:
         self.region_var = tk.StringVar(value="、".join(self.cfg["flip"].get("region_hints") or []))
         ttk.Entry(rg, textvariable=self.region_var, font=self.font).pack(fill="x")
         self.title_var = tk.StringVar(value="、".join(self.cfg["flip"].get("title_hints") or []))
-        ttk.Label(rg, text="浏览器标题关键词：", font=self.font).pack(anchor="w", pady=(8, 2))
+        ttk.Label(rg, text="浏览器标题关键词（标题里出现这些词，才认为是需要翻墙的网页）：",
+                  font=self.font).pack(anchor="w", pady=(8, 2))
         ttk.Entry(rg, textvariable=self.title_var, font=self.font).pack(fill="x")
+        ttk.Button(rg, text="恢复默认关键词（含 google / youtube / twitter 等）",
+                   command=self.restore_default_hints).pack(anchor="w", pady=(6, 0))
+        ttk.Label(rg, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="提示：从老版本升级上来时，这里保留的是你原来的关键词，不会自动增加。"
+                       "想让「打开 Google 就翻墙」，点上面的按钮，或手动把 google 加进去。"
+                  ).pack(anchor="w", pady=(2, 0))
 
     # ======================================================= 小工具
     def _fill_list(self, widget, items):
@@ -396,6 +415,14 @@ class App:
 
     def checked_client_ids(self):
         return [cid for cid, on in self._client_rows if on]
+
+    def restore_default_hints(self):
+        """把目标地区关键词和浏览器标题关键词恢复成内置默认值。"""
+        d = C.DEFAULT_CONFIG["flip"]
+        self.region_var.set("、".join(d["region_hints"]))
+        self.title_var.set("、".join(d["title_hints"]))
+        self.log("已恢复默认关键词：目标地区 %d 个、浏览器标题 %d 个（含 google/youtube/twitter 等），"
+                 "记得点「保存设置」。" % (len(d["region_hints"]), len(d["title_hints"])), "ok")
 
     def _scan_clients(self):
         lines = []
@@ -954,6 +981,7 @@ class App:
         cfg["guard"]["kill_processes"] = self._list_items(self.kill_list)
         cfg["guard"]["wifi_policy"] = self.wifi_policy_var.get()
         cfg["flip"]["enabled"] = bool(self.flip_var.get())
+        cfg["flip"]["when"] = self.flip_when_var.get() or "off_campus"
         cfg["flip"]["order"] = self.checked_client_ids() or []      # 只有勾选的客户端会被使用
         cfg["flip"]["apps"] = self._list_items(self.app_list)
         cfg["flip"]["region_hints"] = [x.strip() for x in self.region_var.get().replace("、", ",").split(",") if x.strip()]
@@ -1150,23 +1178,49 @@ class App:
             self._sleep(15)
 
     def _flip_watch(self):
-        """翻墙模式：没连校园网 + 打开指定程序 → 开客户端 + 切目标地区节点。"""
+        """翻墙模式：打开指定程序 → 开客户端 + 切目标地区节点。
+
+        是否允许"连着校园网时也翻墙"由 flip.when 决定：
+          off_campus（默认）= 只有没连校园网时才开
+          always           = 连着校园网也开（校园网认证完成后再开代理）
+
+        开着代理期间会持续刷新 flip.active 标记，让系统级守护别把它杀掉。
+        """
         cache, last_try, told = {}, 0.0, 0.0
+        own_key = ""            # 本程序亲自开起来的客户端；只要它还活着就保持标记
         while not self.stop_event.is_set():
             try:
                 rules = load_rules(None)
-                if (rules.get("flip") or {}).get("enabled"):
+                flip = rules.get("flip") or {}
+                policy = str(flip.get("when") or "off_campus").lower()
+
+                # 维护"翻墙模式在用代理"标记：活着就刷新，死了就撤掉
+                if own_key:
+                    c = client_by_id(self.cfg, own_key) or {}
+                    procs = list_processes() or {}
+                    alive = any(pids_of(procs, n)
+                                for n in (c.get("cores") or c.get("kill") or []))
+                    if alive:
+                        set_flip_active(own_key, "翻墙模式自动开启的代理")
+                    else:
+                        clear_flip_active()
+                        own_key = ""
+
+                if flip.get("enabled"):
                     hit, what = flip_triggered(rules)
                     if hit:
                         s = self.snap
                         up, desc = campus_link_state(s.get("mode"), s.get("connection"),
                                                      s.get("ssid"), cache,
                                                      self.cfg["campus"].get("wired") or {})
-                        if up:
+                        allowed = (not up) or (policy == "always")
+                        if not allowed:
                             if time.time() - told > 600:
                                 told = time.time()
-                                self.log("检测到 %s，但现在连着校园网（%s）—— 按规则不开代理。"
-                                         % (what, desc), "warn")
+                                self.log("检测到 %s，但现在连着校园网（%s）—— 当前规则是"
+                                         "「只在没连校园网时翻墙」，所以不开。"
+                                         "想让连着校园网也能翻墙，到「翻墙模式」页把"
+                                         "「什么时候翻墙」改成「任何时候」。" % (what, desc), "warn")
                         else:
                             procs = list_processes() or {}
                             running = any(pids_of(procs, n)
@@ -1174,13 +1228,16 @@ class App:
                                           for n in (c.get("cores") or c.get("kill") or []))
                             if not running and time.time() - last_try > 120:
                                 last_try = time.time()
-                                self.log("检测到 %s，且没连校园网 → 打开代理并挑可用节点…"
-                                         % what, "warn")
+                                self.log("检测到 %s，%s → 打开代理并挑可用节点…"
+                                         % (what, "没连校园网" if not up else "按规则允许（连着校园网）"),
+                                         "warn")
                                 ok, name, node, key = ensure_client_ready(
-                                    self.cfg, rules["flip"].get("order") or [], self.log)
+                                    self.cfg, flip.get("order") or [], self.log)
                                 if ok:
                                     self.log("翻墙已就绪：%s → %s" % (name, node), "ok")
-                                    order = rules["flip"].get("order") or []
+                                    own_key = key
+                                    set_flip_active(key, "翻墙模式自动开启的代理")
+                                    order = flip.get("order") or []
                                     rules["flip"]["order"] = [key] + [x for x in order if x != key]
                                     save_rules(rules)
                                 else:
@@ -1222,6 +1279,10 @@ class App:
             return
         self.closing = True
         self.stop_event.set()
+        try:
+            clear_flip_active()          # 撤掉"翻墙模式在用代理"的豁免，免得守护一直不关代理
+        except Exception:
+            pass
         try:
             self.tray.remove()
         except Exception:
