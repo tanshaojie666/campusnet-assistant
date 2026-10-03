@@ -125,10 +125,16 @@ def boot_mode():
                                                    wired_cfg)
 
             # 校园网一连上就关掉代理/VPN（链路级判断，代理软件没法伪造）。
-            # 但有两种情况必须让路：
-            #   1) 翻墙模式正在用代理（flip.active 标记是新的）—— 不能杀掉它刚开的代理；
-            #   2) 链路已经稳定超过 KILL_WINDOW —— 认证早就完成了，此后新开的代理
-            #      不会影响校园网，再反复杀就成了"翻墙永远打不开"。
+            #
+            # 这里要和「翻墙模式」的策略联动，否则两边会打架：
+            #   when = off_campus（默认，推荐）
+            #       翻墙模式不会在校园网上开代理 → 所以只要链路在，就**一直**关代理/VPN，
+            #       这样"连校园网就一定不翻墙"是硬保证。
+            #   when = always（用户明确要连着校园网也翻墙）
+            #       那就只在新连上的 KILL_WINDOW 内关（此时认证需要代理让路），
+            #       链路稳定后不再反复关，并且在翻墙模式正用代理时让路，
+            #       免得把刚开起来的代理在 20 秒内杀掉。
+            flip_policy = str((rules.get("flip") or {}).get("when") or "off_campus").lower()
             if link_up:
                 if not link_started:
                     link_started = time.time()
@@ -140,18 +146,31 @@ def boot_mode():
             fresh_link = bool(link_up and link_started
                               and (time.time() - link_started) <= KILL_WINDOW)
 
-            if kill_on and link_up and flip_on:
-                if not flip_logged:
-                    boot_log("翻墙模式正在使用代理（%s），本次不关闭 —— 避免把它刚开起来的代理杀掉。"
-                             % (flip_client or "未知"))
-                    flip_logged = True
-            elif kill_on and fresh_link:
-                acted, detail = kill_processes(processes, boot_log)
-                if acted:
-                    boot_log("校园网刚连上，" + detail)
-                    link_cache["t"] = 0
-                    boot_heartbeat(False, "", "刚连上校园网，已关闭代理/VPN", campus=link_desc)
-            elif not link_up:
+            if flip_policy == "always":
+                # 用户明确要"连着校园网也翻墙"：给翻墙模式让路，只在刚连上时关
+                if kill_on and link_up and flip_on:
+                    if not flip_logged:
+                        boot_log("翻墙模式正在使用代理（%s），本次不关闭 —— "
+                                 "避免把它刚开起来的代理杀掉。" % (flip_client or "未知"))
+                        flip_logged = True
+                elif kill_on and fresh_link:
+                    acted, detail = kill_processes(processes, boot_log)
+                    if acted:
+                        boot_log("校园网刚连上，" + detail)
+                        link_cache["t"] = 0
+                        boot_heartbeat(False, "", "刚连上校园网，已关闭代理/VPN",
+                                       campus=link_desc)
+            else:
+                # 默认策略：只要连着校园网就一直关代理/VPN ——
+                # 这是"连校园网绝不翻墙"的硬保证（该策略下翻墙模式也不会在校园网上开代理）
+                if kill_on and link_up:
+                    acted, detail = kill_processes(processes, boot_log)
+                    if acted:
+                        boot_log("校园网已连上（策略：校园网内不翻墙），" + detail)
+                        link_cache["t"] = 0
+                        boot_heartbeat(False, "", "校园网已连上，已关闭代理/VPN",
+                                       campus=link_desc)
+            if not link_up:
                 flip_logged = False
 
             ppp_up, ppp_ip = (False, "")
