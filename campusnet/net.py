@@ -484,16 +484,37 @@ def set_adapter_static(name, address, mask="255.255.255.0", gateway="", dns=None
     return ok
 
 
+def set_adapter_disabled(name, disabled=True):
+    """启用/禁用网卡（需要管理员权限）。
+
+    为什么"断开校园网"要靠它：PPPoE 拨号是"骑"在物理网卡上的，
+    而这个拨号连接常常不属于任何可枚举的 RAS 会话 ——
+    `rasdial /disconnect` 会返回成功却什么都不做（实测就是这样：返回码 0，
+    但 PPP 适配器还挂着 IP）。禁用它所依附的网卡则 PPP 链路必定断开，
+    而手机热点 / 无线网不受影响。
+    """
+    if not name:
+        return False
+    state = "admin=disable" if disabled else "admin=enable"
+    return run_cmd(["netsh", "interface", "set", "interface", "name=%s" % name, state],
+                   timeout=60)[0] == 0
+
+
+def adapter_enabled(name):
+    """网卡当前是否处于"已启用"状态。"""
+    for nm, admin, _state in wired_adapters(include_virtual=True):
+        if nm == name:
+            return ("已启用" in admin or "Enabled" in admin)
+    return True
+
+
 def restart_adapter(name):
     """重新启用网卡（拔插网线的软件等价操作），需要管理员权限。"""
     if not name:
         return False
-    run_cmd(["netsh", "interface", "set", "interface", "name=%s" % name, "admin=disable"],
-            timeout=60)
+    set_adapter_disabled(name, True)
     time.sleep(3)
-    ok = run_cmd(["netsh", "interface", "set", "interface", "name=%s" % name, "admin=enable"],
-                 timeout=60)[0] == 0
-    return ok
+    return set_adapter_disabled(name, False)
 
 
 # --------------------------------------------------------------------------
