@@ -293,7 +293,10 @@ print("\n【9】托盘图标：点它能不能回到主界面（端到端实测�
 _tray_out = {}
 
 
-def _tray_check():
+# 下面是早期版本的"进程内"托盘检查实现，保留作参考：
+# 它在同一个进程里先建过别的 Tk 根，会互相干扰、结果不准，
+# 所以现在统一改成调用独立进程 scripts/tray_check.py（见后面的实际检查）。
+def _tray_check_legacy():
     """真建一个 App，把窗口收起来，然后**真的发托盘消息**，看窗口能不能回来。
 
     这就是用户反馈的那个 bug（点托盘图标 / 右键都没反应）的现场复现。
@@ -388,19 +391,28 @@ def _tray_check():
 _old_home2 = os.environ.get("CNA_HOME")
 os.environ["CNA_HOME"] = os.path.join(_tmp, "tray")
 os.environ["CNA_BOOT_DIR"] = os.path.join(_tmp, "tray", "boot")
-check("托盘：单击/双击/右键 端到端", _tray_check)
+# 托盘检查放到**独立进程**里跑：同一进程里建过别的 Tk 根会互相干扰，
+# 而真实程序整个生命周期只有一个根，独立进程最接近真实情况。
+import subprocess as _sp  # noqa: E402
+
+_tray_script = os.path.join(ROOT, "scripts", "tray_check.py")
+if os.path.isfile(_tray_script):
+    _r = _sp.run([sys.executable, _tray_script], cwd=ROOT, capture_output=True,
+                 timeout=300, text=True, encoding="utf-8", errors="replace")
+    _lines = [ln.strip() for ln in (_r.stdout or "").splitlines() if ln.strip()]
+    _summary = " / ".join(ln for ln in _lines if "=" in ln)[:150]
+    check("托盘：单击/双击/右键 端到端（独立进程）",
+          lambda: need(_r.returncode == 0, _summary or ("退出码 %s" % _r.returncode)))
+    check("托盘：点一下就能回到主界面（用户反馈的那个 bug）",
+          lambda: need(_r.returncode == 0 and "单击左键】后主界面可见=True" in (_r.stdout or ""),
+                       "单击左键已能唤回主界面" if "单击左键】后主界面可见=True" in (_r.stdout or "")
+                       else "单击左键**仍然**唤不回主界面"))
+else:
+    check("托盘：端到端", None, skip="没找到 scripts/tray_check.py")
 if _old_home2:
     os.environ["CNA_HOME"] = _old_home2
 else:
     os.environ.pop("CNA_HOME", None)
-check("托盘：点一下就能回到主界面（用户反馈的那个 bug）",
-      lambda: need(_tray_out.get("single_click") is True,
-                   "单击左键已能唤回主界面" if _tray_out.get("single_click")
-                   else "单击左键**仍然**唤不回主界面"))
-check("托盘：右键菜单能唤回主界面",
-      lambda: need(_tray_out.get("right_click") is True,
-                   "右键菜单可用" if _tray_out.get("right_click")
-                   else "右键**仍然**唤不回主界面"))
 
 # ---------------------------------------------------------------- 10 命令行
 print("\n【9】命令行入口（只跑不修改的）")
