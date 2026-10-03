@@ -129,6 +129,13 @@ netsh interface ipv4 set dnsservers name=<网卡> static <DNS1> primary
 
 ## 四、Web 门户认证（Captive Portal）★重点
 
+> **先记住一件事**：门户认证在界面里是**独立的一项设置**（「网页（门户）认证设置…」按钮），
+> **有线和无线共用**。也就是说：
+> - 有线走 DHCP / 静态 IP 之后被门户拦住 → 会用它；
+> - **无线连上指定 SSID 却上不了网** → 也会用它（校园 WiFi 绝大多数都是这种情况）。
+>
+> 配置位置：`campus.portal`（早期版本存在 `campus.wired.portal`，程序会自动兼容沿用）。
+
 **什么样**：拿到 IP 了，但打开任何网页都会跳到学校的登录页，输学号密码后才放行。
 国内常见厂商：**深信服 Sangfor、锐捷 Ruijie、城市热点 Dr.COM、H3C**。
 
