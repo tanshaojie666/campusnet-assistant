@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用问题 / 讨论
+    url: https://github.com/tanshaojie666/campusnet-assistant/discussions
+    about: 不确定是不是 bug、或者想问怎么配置，来这里。
+  - name: 有线接入方式详解
+    url: https://github.com/tanshaojie666/campusnet-assistant/blob/main/docs/WIRED.md
+    about: PPPoE / DHCP / 静态IP / 门户认证 / 学校客户端 / 802.1X 怎么配、怎么排查。
+  - name: 如何添加自己的翻墙客户端
+    url: https://github.com/tanshaojie666/campusnet-assistant/blob/main/docs/CLIENTS.md
+    about: 把你正在用的 mihomo/Clash 系客户端接进来。
+  - name: 安全漏洞（请走私密渠道）
+    url: https://github.com/tanshaojie666/campusnet-assistant/security/advisories/new
+    about: 涉及密码、越权、命令执行的问题请不要开公开 issue。
