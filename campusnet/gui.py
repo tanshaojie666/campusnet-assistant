@@ -82,7 +82,9 @@ class App:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._sync_snap()
         self._refresh_wired_summary()
-        self.log("程序已启动。接入方式：%s" % MODE_LABEL.get(self.snap["mode"], self.snap["mode"]))
+        self.log("程序已启动（v%s）。接入方式：%s"
+                 % (__import__("campusnet").__version__,
+                    MODE_LABEL.get(self.snap["mode"], self.snap["mode"])))
         if self.tray_ok:
             self.log("已驻留右下角托盘：点 × 只是把窗口收起来，程序继续在后台跑。")
         self.root.after(150, self._pump)
