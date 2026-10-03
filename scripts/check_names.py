@@ -36,6 +36,10 @@ BUILTINS = set(dir(builtins)) | {
 }
 NESTED = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 COMPS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+# match 捕获（Python 3.10+ 才有这些节点，3.9 下要跳过，否则 AttributeError）
+MATCH_AS = getattr(ast, "MatchAs", None)
+MATCH_STAR = getattr(ast, "MatchStar", None)
+MATCH_MAP = getattr(ast, "MatchMapping", None)
 
 
 def _params(fn):
@@ -73,11 +77,11 @@ def _bound(node):
                 names.add(ch.id)
             elif isinstance(ch, ast.ExceptHandler) and ch.name:
                 names.add(ch.name)
-            elif isinstance(ch, ast.MatchAs) and ch.name:
+            elif MATCH_AS is not None and isinstance(ch, MATCH_AS) and ch.name:
                 names.add(ch.name)
-            elif isinstance(ch, ast.MatchStar) and ch.name:
+            elif MATCH_STAR is not None and isinstance(ch, MATCH_STAR) and ch.name:
                 names.add(ch.name)
-            elif isinstance(ch, ast.MatchMapping) and ch.rest:
+            elif MATCH_MAP is not None and isinstance(ch, MATCH_MAP) and ch.rest:
                 names.add(ch.rest)
             elif isinstance(ch, ast.arg):
                 names.add(ch.arg)

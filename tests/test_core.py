@@ -757,8 +757,11 @@ class TestHotspotAutoConnect(unittest.TestCase):
             self.skipTest("没有 tkinter")
         from campusnet import gui as G
 
-        root = tk.Tk()
-        root.withdraw()
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest("这个环境起不了 tkinter 窗口：%s" % exc)
         app = None
         try:
             app = G.App(root, C.load_config())
