@@ -21,8 +21,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from . import config as C
 from .clients import client_by_id, client_installed, scan_clients
-from .config import (APP_TITLE, CONFIG_FILE, HOME_DIR, LOG_FILE, clear_flip_active,
-                     heartbeat_state, load_config, load_rules, save_config, save_rules,
+from .config import (APP_TITLE, CONFIG_FILE, HOME_DIR, LOG_FILE, clear_disconnect,
+                     clear_flip_active, clear_pause, heartbeat_state, load_config,
+                     load_rules, request_disconnect, save_config, save_rules,
                      set_account, set_flip_active, set_pause)
 from .guard import boot_task_registered
 from .installer import install_boot, uninstall_boot
@@ -1138,6 +1139,9 @@ class App:
             self.log("保存失败：%s" % exc, "err")
 
     def connect(self, force=False):
+        """立即连接：先取消"先别拨"暂停与断开请求，再开始拨号。"""
+        clear_pause()
+        clear_disconnect()
         if self.busy:
             return
         self.busy = True
@@ -1179,11 +1183,23 @@ class App:
             self.queue.put(("buttons", True))
 
     def disconnect(self):
+        """断开校园网。
+
+        注意：拨号是**系统级守护以 SYSTEM 身份**建立的，界面程序没有权限断开它
+        （直接 rasdial /disconnect 会静默失败，用户看到的就是"点了没反应/断不开"）。
+        所以这里做两件事：
+          1. 写「暂停自动拨号」标志（守护看到就不会马上又拨回来）
+          2. 写「断开请求」文件，让守护去真正挂断（它有权限，最多 15 秒生效）
+        """
         s = self.snap
-        set_pause(10)
-        if s["mode"] in ("wired", "both") and s["connection"]:
-            ras_hangup(s["connection"])
-        self.log("已断开，并通知系统级守护暂停 10 分钟（免得立刻又连上）。")
+        set_pause(24 * 60)                       # 暂停到用户主动点「立即连接」为止
+        try:
+            ras_hangup(s["connection"]) if s.get("connection") else None
+        except Exception:
+            pass
+        request_disconnect("用户在界面点了断开")
+        self.log("已请求断开校园网：系统级守护会在 15 秒内执行（它有权限，界面没有）。"
+                 "自动拨号已暂停，直到你点「立即连接」。", "warn")
         self._refresh_status()
 
     def open_log(self):
