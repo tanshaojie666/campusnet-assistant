@@ -84,13 +84,39 @@ DEFAULT_CLIENTS = [
 
 DEFAULT_CONFIG = {
     "campus": {
-        "mode": "wired",                 # wired=有线PPPoE / wireless=无线 / both
+        "mode": "wired",                 # wired=有线 / wireless=无线 / both
         "connection": "",                # PPPoE 连接名，留空自动探测
         "wifi_ssid": "",                 # 无线 SSID（wireless/both 时使用）
         "account": "",
         "password_enc": "",
         "interval": 15,
         "probes": [],                    # 探测目标 [[host, port], ...]，留空自动用 PPP 的 DNS
+        # 有线接入方式：可多选，按这个顺序执行
+        #   pppoe   PPPoE 拨号（宿舍网口最常见）
+        #   dhcp    自动获取 IP（插上网线就有 IP）
+        #   static  静态 IP（学校分配固定 IP/网关/DNS）
+        #   portal  Web 门户认证（深信服 / 锐捷 / Dr.COM 这类登录页）
+        #   client  学校专用认证客户端
+        #   lan     有线 802.1X（Windows 自带）
+        #   restart 先把网卡重启一遍（拔插网线的软件版，网口卡住时有用）
+        "wired": {
+            "auth": [],                  # 留空自动推断：配了 connection → ["pppoe"]，否则 ["dhcp"]
+            "adapter": "",               # 有线网卡名，留空自动选第一块
+            "static": {"address": "", "mask": "255.255.255.0", "gateway": "", "dns": []},
+            "client_exe": "",            # 学校认证客户端路径
+            "lan_profile": "",           # 已保存的 802.1X 配置名
+            "portal": {
+                "mode": "auto",          # auto=自动填表 / template=按模板提交 / script=跑命令
+                "url": "",               # 门户地址（留空自动从跳转里取）
+                "method": "post",        # post / get
+                "body": "",              # 提交内容模板，支持 {username}/{password}
+                "headers": {},           # 自定义请求头
+                "probe_url": "",         # 判断是否已放行的地址（留空用内置的）
+                "script": "",            # mode=script 时执行的命令
+                "username": "",          # 门户账号（留空用拨号账号）
+                "password_enc": "",      # 门户密码（留空用拨号密码）
+            },
+        },
     },
     "guard": {
         "kill_proxies": True,            # 连上校园网就关掉下面的进程
@@ -126,20 +152,24 @@ def expand(path: str) -> str:
 # --------------------------------------------------------------------------
 # 用户配置
 # --------------------------------------------------------------------------
+def _deep_merge(defaults, user):
+    """把用户配置合并到默认值上：嵌套字典逐层合并，新增字段不会把用户设置整段顶掉。"""
+    out = dict(defaults)
+    if not isinstance(user, dict):
+        return out
+    for key, value in user.items():
+        if isinstance(out.get(key), dict) and isinstance(value, dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def load_config():
     cfg = json_load(CONFIG_FILE, None)
     if not isinstance(cfg, dict):
         cfg = {}
-    merged = {}
-    for section, defaults in DEFAULT_CONFIG.items():
-        value = cfg.get(section)
-        if isinstance(defaults, dict):
-            merged[section] = dict(defaults)
-            if isinstance(value, dict):
-                merged[section].update(value)
-        else:
-            merged[section] = value if value is not None else defaults
-    return merged
+    return _deep_merge(DEFAULT_CONFIG, cfg)
 
 
 def save_config(cfg):
@@ -211,16 +241,33 @@ def save_boot_config(data):
     return True
 
 
+def portal_credentials(cfg):
+    """门户认证用的账号密码；没单独配就沿用拨号账号。"""
+    campus = cfg.get("campus") or {}
+    portal = (campus.get("wired") or {}).get("portal") or {}
+    user = portal.get("username") or campus.get("account") or ""
+    enc = portal.get("password_enc") or campus.get("password_enc") or ""
+    return user, (dpapi_decrypt(enc) if enc else "")
+
+
 def build_boot_config(cfg) -> dict:
     """把用户配置转成系统级守护要用的那份（含机器范围加密的密码）。"""
     campus = cfg.get("campus") or {}
     guard = cfg.get("guard") or {}
+    wired = dict(campus.get("wired") or {})
+    portal = dict(wired.get("portal") or {})
+    p_user, p_pwd = portal_credentials(cfg)
+    portal["username"] = p_user
+    portal["password_enc"] = ""                       # 不存用户范围密文
+    portal["password_machine"] = dpapi_encrypt(p_pwd, machine=True) if p_pwd else ""
+    wired["portal"] = portal
     return {
         "mode": campus.get("mode", "wired"),
         "connection": campus.get("connection", ""),
         "wifi_ssid": campus.get("wifi_ssid", ""),
         "account": campus.get("account", ""),
         "password_machine": dpapi_encrypt(get_password(cfg), machine=True),
+        "wired": wired,
         "interval": int(campus.get("interval") or 15),
         "probes": campus.get("probes") or [],
         "kill_proxies": bool(guard.get("kill_proxies", True)),
