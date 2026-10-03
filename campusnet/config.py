@@ -160,6 +160,9 @@ DEFAULT_CONFIG = {
                         "stackoverflow", "stack overflow", "huggingface", "copilot",
                         "bing.com", "duckduckgo"],
         "auto_close": False,             # 触发程序全部退出后是否自动关掉客户端
+        # 浏览器一打开就翻墙（不靠窗口标题判断）。
+        # 最可靠：不受标题语言、报错页、新标签页影响；代价是一开浏览器就开代理。
+        "browser_always": False,
     },
     "clients": DEFAULT_CLIENTS,
     "ui": {"minimize_to_tray": True},
