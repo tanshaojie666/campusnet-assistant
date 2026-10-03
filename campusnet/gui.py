@@ -223,6 +223,16 @@ class App:
         ttk.Button(kb, text="用内置名单", command=self._kill_reset).pack(side="left", padx=6)
         self._fill_list(self.kill_list, self.cfg["guard"].get("kill_processes") or [])
 
+        self.reconnect_var = tk.BooleanVar(
+            value=bool(self.cfg["guard"].get("reconnect_when_no_flip")))
+        ttk.Checkbutton(kill, variable=self.reconnect_var,
+                        text="断开后如果一直没在用代理（没在翻墙），就自动把校园网连回来").pack(
+            anchor="w", pady=(6, 0))
+        ttk.Label(kill, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="勾上之后：为翻墙而点「断开」→ 翻完墙 / 没在翻墙 → 自动恢复校园网，"
+                       "你就不用管了。\n判定「没在用代理」看的是翻墙标记 + 上面的关闭名单里的进程。"
+                  ).pack(anchor="w", pady=(2, 0))
+
         wp = ttk.LabelFrame(f, text=" 无线策略 ", padding=12)
         wp.pack(fill="x", pady=(12, 0))
         self.wifi_policy_var = tk.StringVar(value=self.cfg["guard"].get("wifi_policy", "off"))
@@ -1074,6 +1084,7 @@ class App:
         cfg["guard"]["kill_proxies"] = bool(self.kill_var.get())
         cfg["guard"]["kill_processes"] = self._list_items(self.kill_list)
         cfg["guard"]["wifi_policy"] = self.wifi_policy_var.get()
+        cfg["guard"]["reconnect_when_no_flip"] = bool(self.reconnect_var.get())
         cfg["flip"]["enabled"] = bool(self.flip_var.get())
         cfg["flip"]["when"] = self.flip_when_var.get() or "off_campus"
         cfg["flip"]["browser_always"] = bool(self.browser_always_var.get())
@@ -1086,6 +1097,7 @@ class App:
         rules["kill_proxies"] = cfg["guard"]["kill_proxies"]
         rules["processes"] = cfg["guard"]["kill_processes"]
         rules["wifi_policy"] = cfg["guard"]["wifi_policy"]
+        rules["reconnect_when_no_flip"] = cfg["guard"]["reconnect_when_no_flip"]
         rules["flip"] = cfg["flip"]
         save_rules(rules)
         if cfg["campus"]["account"] and self.pwd_var.get():

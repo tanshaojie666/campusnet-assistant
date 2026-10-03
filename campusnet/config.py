@@ -141,6 +141,11 @@ DEFAULT_CONFIG = {
             "魔戒.exe", "mojie-service.exe", "mojie-windows-amd64.exe",
         ],
         "wifi_policy": "off",            # off / manual=全部改手动连接 / disable=禁用网卡
+        # 「断开校园网」之后，如果一直没在使用代理（没在翻墙），就自动把校园网连回来。
+        # 典型场景：为了翻墙而断开校园网 → 翻完墙 / 根本没翻 → 自动恢复校园网。
+        # 默认关闭：手动断开就保持断开，直到点「立即连接」。打开后断开就真的不用管。
+        "reconnect_when_no_flip": False,
+        "reconnect_after": 180,          # 断开多久、且确认没在用代理之后才恢复（秒）
     },
     "flip": {
         "enabled": False,                # 翻墙模式：打开指定程序就开 VPN
@@ -225,13 +230,16 @@ def rules_path(cfg=None) -> str:
 
 def load_rules(cfg=None):
     d = {"kill_proxies": True, "processes": list(DEFAULT_CONFIG["guard"]["kill_processes"]),
-         "wifi_policy": "off", "flip": dict(DEFAULT_CONFIG["flip"])}
+         "wifi_policy": "off", "reconnect_when_no_flip": False,
+         "flip": dict(DEFAULT_CONFIG["flip"])}
     data = json_load(rules_path(cfg) if cfg else RULES_FILE, None)
     if isinstance(data, dict):
         if "enabled" in data:                 # 兼容旧字段名
             d["kill_proxies"] = bool(data["enabled"])
         if "kill_proxies" in data:
             d["kill_proxies"] = bool(data["kill_proxies"])
+        if "reconnect_when_no_flip" in data:
+            d["reconnect_when_no_flip"] = bool(data["reconnect_when_no_flip"])
         if data.get("processes"):
             d["processes"] = [str(x).lower() for x in data["processes"]]
         if data.get("wifi_policy") in ("off", "manual", "disable"):
@@ -248,6 +256,7 @@ def save_rules(rules):
     data["kill_proxies"] = bool(rules.get("kill_proxies", True))
     data["processes"] = [str(x).lower() for x in rules.get("processes", [])]
     data["wifi_policy"] = rules.get("wifi_policy", "off")
+    data["reconnect_when_no_flip"] = bool(rules.get("reconnect_when_no_flip", False))
     data["flip"] = dict(rules.get("flip", {}))
     json_dump(RULES_FILE, data)
     return True

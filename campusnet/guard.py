@@ -24,7 +24,7 @@ from .net import (adapter_ip, apply_wifi_policy, campus_link_state, friendly_err
                   wired_auth_list, wired_authenticate, wired_bind_ip)
 from .net import build_prober
 from .rules import kill_processes
-from .util import named_mutex, sleep_interruptible
+from .util import list_processes, named_mutex, pids_of, sleep_interruptible
 
 MODE_LABEL = {"wired": "有线", "wireless": "无线", "both": "有线+无线"}
 
@@ -85,6 +85,15 @@ def boot_mode():
     link_cache = {}
     fails, backoff = 0, interval
     last_wifi = 0.0
+    # 「断开后没在翻墙就自动连回来」用到的开关
+    guard_cfg = cfg.get("guard") or {}
+    reconnect_no_flip = bool(guard_cfg.get("reconnect_when_no_flip"))
+    try:
+        reconnect_after = max(60, int(guard_cfg.get("reconnect_after") or 180))
+    except (TypeError, ValueError):
+        reconnect_after = 180
+    wait_proxy_logged = False
+    procs_snapshot = {}
     link_started = 0.0            # 校园网链路是什么时候连上的（用于 KILL_WINDOW 判断）
     flip_logged = False           # 「翻墙模式在用代理」这条日志只记一次，避免刷屏
     mtime = _script_mtime()
@@ -129,6 +138,11 @@ def boot_mode():
             kill_on = bool(rules.get("kill_proxies", cfg.get("kill_proxies", True)))
             processes = rules.get("processes") or cfg.get("processes") or []
             wifi_policy = rules.get("wifi_policy") or cfg.get("wifi_policy") or "off"
+            # 「断开后没在翻墙就自动连回来」也支持界面开关实时生效
+            guard_rules = cfg.get("guard") or {}
+            reconnect_no_flip = bool(rules.get("reconnect_when_no_flip",
+                                               guard_rules.get("reconnect_when_no_flip")))
+            procs_snapshot = list_processes() or {}
 
             if wifi_policy != "off" and time.time() - last_wifi > 600:
                 _ok, _total, msg = apply_wifi_policy(wifi_policy)
@@ -232,6 +246,31 @@ def boot_mode():
                                        campus=link_desc)
             if not link_up:
                 flip_logged = False
+
+            # 可选：断开校园网之后，如果一直没在使用代理（没在翻墙），就自动连回来。
+            # 场景很实用：为了翻墙而断开校园网 → 翻完了 / 压根没翻 → 自动恢复校园网。
+            # 判定"没在用代理"用两个信号：flip.active 标记 + 关代理名单里的进程，
+            # 所以不依赖界面程序是否在运行。
+            if reconnect_no_flip and pause_active(pause_file, cfg):
+                _flip_on2, _fc2, _fn2, _fage2 = flip_active(cfg)
+                proxying = _flip_on2 or any(pids_of(procs_snapshot, n) for n in processes)
+                if proxying:
+                    if not wait_proxy_logged:
+                        boot_log("已按请求断开校园网；检测到正在使用代理 → 暂不连回来。")
+                        wait_proxy_logged = True
+                else:
+                    try:
+                        waited = time.time() - os.path.getmtime(pause_file)
+                    except OSError:
+                        waited = reconnect_after
+                    if waited >= reconnect_after:
+                        clear_pause(cfg)
+                        boot_log("已经断开 %.1f 分钟且没有在使用代理 → 自动把校园网连回来。"
+                                 % (waited / 60.0))
+                        wait_proxy_logged = False
+                        link_cache["t"] = 0
+            else:
+                wait_proxy_logged = False
 
             ppp_up, ppp_ip = (False, "")
             if mode in ("wired", "both") and connection and "pppoe" in wires:

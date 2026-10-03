@@ -351,6 +351,21 @@ class TestRuntimeSignals(unittest.TestCase):
         self.assertIn("google", flip["title_hints"])        # 打开 Google 能触发
         self.assertIn("youtube", flip["title_hints"])
 
+    def test_reconnect_defaults_off(self):
+        """「断开后没在翻墙就自动连回来」是可选功能，默认关闭（手动断开应当保持）。"""
+        guard = DEFAULT_CONFIG["guard"]
+        self.assertFalse(guard["reconnect_when_no_flip"])
+        self.assertGreaterEqual(guard["reconnect_after"], 60)
+
+    def test_reconnect_flag_roundtrip(self):
+        """这个开关要能通过 rules.json 传给系统级守护，并且界面改了立即生效。"""
+        C.save_rules({"kill_proxies": True, "processes": [], "wifi_policy": "off",
+                      "reconnect_when_no_flip": True, "flip": {}})
+        self.assertTrue(C.load_rules(None)["reconnect_when_no_flip"])
+        C.save_rules({"kill_proxies": True, "processes": [], "wifi_policy": "off",
+                      "reconnect_when_no_flip": False, "flip": {}})
+        self.assertFalse(C.load_rules(None)["reconnect_when_no_flip"])
+
 
 class TestClientSelection(unittest.TestCase):
     """翻墙客户端勾选：只勾谁就只用谁（flip.order 里只放勾选的 id）。"""
