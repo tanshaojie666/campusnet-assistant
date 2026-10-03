@@ -1,13 +1,11 @@
 # CampusNetAssistant · 校园网助手
 
 [![Release](https://img.shields.io/github/v/release/tanshaojie666/campusnet-assistant?label=release)](https://github.com/tanshaojie666/campusnet-assistant/releases/latest)
+[![CI](https://github.com/tanshaojie666/campusnet-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/tanshaojie666/campusnet-assistant/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
-<!-- CI 徽章：把 .github/workflows/ci.yml 推上去之后取消下面这行注释即可
-[![CI](https://github.com/tanshaojie666/campusnet-assistant/actions/workflows/ci.yml/badge.svg)](https://github.com/tanshaojie666/campusnet-assistant/actions/workflows/ci.yml)
--->
 
 **English:** CampusNetAssistant is a dependency-free Windows utility (pure Python standard library + tkinter) that keeps your campus network connected, closes the proxy/VPN clients that break campus authentication, and — when you launch a program that needs it — automatically starts your chosen proxy client, picks the fastest working node by real latency testing, and turns on the system proxy. No third-party packages, no telemetry, passwords encrypted with Windows DPAPI.
 
