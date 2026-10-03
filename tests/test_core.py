@@ -291,6 +291,67 @@ class TestPortalShared(unittest.TestCase):
         self.assertEqual(pwd, "pw")
 
 
+class TestRuntimeSignals(unittest.TestCase):
+    """守护与界面之间的"信号文件"：暂停 / 断开请求 / 被禁用网卡 / 翻墙标记。
+
+    这些是 1.5~1.6 版为了修「断不开""守护误杀代理"而加的机制，
+    都是纯文件读写，最容易悄悄坏掉，所以重点测。
+    """
+
+    def tearDown(self):
+        C.clear_pause()
+        C.clear_disconnect()
+        C.clear_disabled_adapter()
+        C.clear_flip_active()
+
+    def test_pause_lifecycle(self):
+        self.assertFalse(C.pause_active())
+        C.set_pause(5)
+        self.assertTrue(C.pause_active())
+        C.clear_pause()
+        self.assertFalse(C.pause_active())
+
+    def test_expired_pause_is_inactive(self):
+        C.set_pause(-1)                      # 已经过期
+        self.assertFalse(C.pause_active())
+
+    def test_disconnect_request(self):
+        self.assertFalse(C.disconnect_requested())
+        self.assertTrue(C.request_disconnect("test"))
+        self.assertTrue(C.disconnect_requested())
+        C.clear_disconnect()
+        self.assertFalse(C.disconnect_requested())
+
+    def test_disabled_adapter_is_remembered(self):
+        """必须记住具体是哪块网卡：否则恢复时会启用错的那一块。"""
+        self.assertEqual(C.get_disabled_adapter(), "")
+        C.set_disabled_adapter("以太网")
+        self.assertEqual(C.get_disabled_adapter(), "以太网")
+        C.clear_disabled_adapter()
+        self.assertEqual(C.get_disabled_adapter(), "")
+
+    def test_flip_active_lifecycle(self):
+        self.assertFalse(C.flip_active(None)[0])
+        C.set_flip_active("eix", "测试")
+        on, client, _note, age = C.flip_active(None)
+        self.assertTrue(on)
+        self.assertEqual(client, "eix")
+        self.assertLess(age, 5)
+        C.clear_flip_active()
+        self.assertFalse(C.flip_active(None)[0])
+
+    def test_flip_active_expires(self):
+        C.set_flip_active("eix")
+        self.assertFalse(C.flip_active(None, max_age=-1)[0])
+
+    def test_flip_defaults_are_safe(self):
+        flip = DEFAULT_CONFIG["flip"]
+        self.assertEqual(flip["when"], "off_campus")       # 默认：校园网内不翻墙
+        self.assertFalse(flip["browser_always"])            # 默认：不靠"浏览器开着"触发
+        self.assertIn("google", flip["title_hints"])        # 打开 Google 能触发
+        self.assertIn("youtube", flip["title_hints"])
+
+
 class TestClientSelection(unittest.TestCase):
     """翻墙客户端勾选：只勾谁就只用谁（flip.order 里只放勾选的 id）。"""
 
