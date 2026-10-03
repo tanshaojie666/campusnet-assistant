@@ -1,0 +1,23 @@
+# 统一换行风格：代码用 LF，Windows 批处理用 CRLF
+# （.cmd 内容保持纯 ASCII 是硬性要求：中文在 .cmd 里可能被 cmd.exe 按错误代码页解读）
+
+* text=auto eol=lf
+
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+*.py   text eol=lf
+*.pyw  text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.json text eol=lf
+
+# 二进制（不要做任何换行转换）
+*.zip   binary
+*.exe   binary
+*.dll   binary
+*.pyd   binary
+*.ico   binary
+*.png   binary
+*.jpg   binary
