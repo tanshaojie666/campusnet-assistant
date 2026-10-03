@@ -15,8 +15,8 @@ import time
 from .config import (BOOT_CONFIG, BOOT_LOG, BOOT_STOP, BOOT_TASK, CONFIG_FILE,
                      boot_heartbeat, boot_log, clear_disabled_adapter, clear_disconnect,
                      clear_pause, disconnect_requested, flip_active, get_disabled_adapter,
-                     heartbeat_state, load_boot_config, load_rules, pause_active,
-                     set_disabled_adapter)
+                     get_network_choice, heartbeat_state, load_boot_config, load_rules,
+                     pause_active, set_disabled_adapter)
 from .clients import scan_clients
 from .net import (adapter_ip, apply_wifi_policy, campus_link_state, friendly_error,
                   pppoe_connections, ppp_state, ppp_state_cached, ras_dial, ras_hangup,
@@ -251,7 +251,8 @@ def boot_mode():
             # 场景很实用：为了翻墙而断开校园网 → 翻完了 / 压根没翻 → 自动恢复校园网。
             # 判定"没在用代理"用两个信号：flip.active 标记 + 关代理名单里的进程，
             # 所以不依赖界面程序是否在运行。
-            if reconnect_no_flip and pause_active(pause_file, cfg):
+            if reconnect_no_flip and pause_active(pause_file, cfg) \
+                    and get_network_choice(cfg) not in ("wifi", "none"):
                 _flip_on2, _fc2, _fn2, _fage2 = flip_active(cfg)
                 proxying = _flip_on2 or any(pids_of(procs_snapshot, n) for n in processes)
                 if proxying:
@@ -307,7 +308,11 @@ def boot_mode():
                 continue
 
             fails += 1
-            if fails < 2:
+            # 拨号时机：如果目标就是校园网（PPPoE 没连上、且不是"用户故意切走"的状态），
+            # **第一次失败就拨**，不再等第二次 —— 否则白白多等一个巡检间隔（默认 15 秒）。
+            want_campus = bool(connection and "pppoe" in wires and not ppp_up
+                               and get_network_choice(cfg) not in ("wifi", "none"))
+            if fails < (1 if want_campus else 2):
                 sleep_interruptible(interval, lambda: os.path.isfile(BOOT_STOP))
                 continue
 
@@ -321,22 +326,34 @@ def boot_mode():
 
             use_pppoe = ("pppoe" in wires) and bool(connection)
             if mode in ("wired", "both") and use_pppoe:
-                boot_log("检测到掉线，开始拨号…")
+                boot_log("检测到校园网没连上，准备拨号…")
+                # 先干掉代理/VPN：它们会抢路由、拦 DNS，导致拨号慢甚至拨不上。
+                # 杀完只等 2 秒（原来是 3 秒）就继续，尽量快。
                 if kill_on:
+                    t_kill = time.time()
                     acted, detail = kill_processes(processes)
                     if acted:
-                        boot_log("拨号前先关闭了代理/VPN：" + detail)
-                        sleep_interruptible(3)
+                        boot_log("已先关闭代理/VPN（用时 %.1f 秒）：%s"
+                                 % (time.time() - t_kill, detail))
+                        sleep_interruptible(2, lambda: os.path.isfile(BOOT_STOP))
                 ras_hangup(connection, phonebook)
                 code, text = ras_dial(connection, account, password, phonebook)
                 if code == 0:
-                    time.sleep(5)
+                    # 不再死等固定 5 秒：PPP 一拿到地址就立刻继续（通常 1~2 秒）
                     link_cache["t"] = 0
-                    ppp_up2, ppp_ip2 = ppp_state_cached(connection, link_cache)
+                    ppp_up2, ppp_ip2 = (False, "")
+                    t_dial = time.time()
+                    for _ in range(10):
+                        time.sleep(1)
+                        link_cache["t"] = 0
+                        ppp_up2, ppp_ip2 = ppp_state_cached(connection, link_cache)
+                        if ppp_up2:
+                            break
                     ok2, ip2, why2 = prober.check(bind_ip=ppp_ip2 or None)
                     boot_heartbeat(ok2, ip2, why2)
                     if ok2:
-                        boot_log("拨号成功，已联网（IP %s）" % (ip2 or "?"))
+                        boot_log("拨号成功，已联网（IP %s，用时 %.1f 秒）"
+                                 % (ip2 or "?", time.time() - t_dial))
                         fails, backoff = 0, interval
                     else:
                         boot_log("拨号返回成功，但还探测不到网络。")

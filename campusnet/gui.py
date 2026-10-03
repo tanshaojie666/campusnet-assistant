@@ -28,7 +28,7 @@ from .config import (APP_TITLE, CONFIG_FILE, HOME_DIR, LOG_FILE, clear_disconnec
 from .guard import boot_task_registered
 from .installer import install_boot, uninstall_boot
 from .net import (build_prober, campus_link_state, pppoe_connections, ppp_state,
-                  ras_dial, ras_hangup, wifi_profiles)
+                  ras_dial, ras_hangup, wifi_connect, wifi_profiles)
 from .clients import ensure_client_ready
 from .rules import flip_triggered
 from .util import TrayIcon, create_no_window_flag, dpapi_decrypt, dpapi_encrypt, \
@@ -207,6 +207,27 @@ class App:
         ttk.Label(grid, text="密码用 Windows DPAPI 加密后存在本机，不存明文、不上传。",
                   foreground="#5f6368", font=("Microsoft YaHei UI", 9)).grid(
             row=4, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        # ---- 手动切换网络 ----
+        sw = ttk.LabelFrame(f, text=" 手动切换网络 ", padding=12)
+        sw.pack(fill="x", pady=(10, 0))
+        self.net_mode_var = tk.StringVar(value="campus")
+        ttk.Radiobutton(sw, text="校园网（有线拨号）—— 取消暂停，守护会重新启用网线并拨号",
+                        value="campus", variable=self.net_mode_var).pack(anchor="w")
+        sw_row = ttk.Frame(sw)
+        sw_row.pack(fill="x")
+        ttk.Radiobutton(sw_row, text="无线：", value="wifi",
+                        variable=self.net_mode_var).pack(side="left")
+        self.net_ssid_var = tk.StringVar(value=self.cfg["campus"].get("wifi_ssid") or "")
+        ttk.Combobox(sw_row, textvariable=self.net_ssid_var, font=self.font, width=26,
+                     values=wifi_profiles()).pack(side="left", padx=6)
+        ttk.Radiobutton(sw, text="全部断开（只用别的网络，比如手机热点）", value="none",
+                        variable=self.net_mode_var).pack(anchor="w")
+        ttk.Button(sw, text="切换到这个网络", command=self.switch_network).pack(
+            anchor="w", pady=(8, 0))
+        ttk.Label(sw, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
+                  text="手动选过之后，自动逻辑会让路 —— 不会再自己把校园网拨回来，"
+                       "直到你切回「校园网」。").pack(anchor="w", pady=(4, 0))
 
         kill = ttk.LabelFrame(f, text=" 连上校园网后自动关闭的代理/VPN ", padding=12)
         kill.pack(fill="both", expand=True, pady=(12, 0))
@@ -944,6 +965,51 @@ class App:
 
         self.log("正在检查更新…")
         threading.Thread(target=work, daemon=True).start()
+
+    def switch_network(self):
+        """手动切换网络：校园网 / 某个无线 / 全部断开。
+
+        复用了已经验证过的机制，不新造轮子：
+          · 切校园网 = 取消暂停与断开状态 → 守护会重新启用网线并拨号
+          · 切无线   = 暂停自动拨号 + 请求守护断开校园网（必要时禁网卡）+ 连该 SSID
+          · 全部断开 = 暂停自动拨号 + 请求守护断开校园网
+        并记下"手动选择"，让「没翻墙就自动连回校园网」那个自动逻辑让路。
+        """
+        from .config import clear_disabled_adapter, clear_network_choice, \
+            clear_pause, request_disconnect, set_network_choice
+        choice = self.net_mode_var.get()
+        try:
+            if choice == "campus":
+                clear_network_choice()
+                clear_pause()
+                clear_disconnect()
+                clear_disabled_adapter()
+                self.log("已切换到校园网：取消暂停与断开状态，守护会在 15 秒内重新启用网线并拨号。",
+                         "ok")
+            elif choice == "wifi":
+                ssid = self.net_ssid_var.get().strip()
+                if not ssid:
+                    self.log("请先选择或填写一个无线网络名（SSID）。", "warn")
+                    return
+                set_network_choice("wifi", ssid)
+                set_pause(24 * 60)
+                request_disconnect("手动切换到无线：%s" % ssid)
+                ok, _out = wifi_connect(ssid)
+                self.log("已切换到无线「%s」：连接%s；校园网已请求断开（约 15 秒生效），"
+                         "自动拨号已暂停。" % (ssid, "已发起" if ok else "发起失败"),
+                         "ok" if ok else "warn")
+                self.cfg["campus"]["wifi_ssid"] = ssid
+                self.ssid_var.set(ssid)
+                self.save()
+            else:
+                set_network_choice("none")
+                set_pause(24 * 60)
+                request_disconnect("手动全部断开")
+                self.log("已请求断开校园网并暂停自动拨号（约 15 秒生效）；"
+                         "无线/热点那些不归本程序管，不受影响。", "warn")
+            self._refresh_status()
+        except Exception as exc:  # noqa: BLE001
+            self.log("切换网络失败：%s" % exc, "err")
 
     def check_now(self):
         self._refresh_status()

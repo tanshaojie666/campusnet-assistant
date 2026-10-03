@@ -133,6 +133,8 @@ DEFAULT_CONFIG = {
     },
     "guard": {
         "kill_proxies": True,            # 连上校园网就关掉下面的进程
+        # 拨号前是否也先关掉代理/VPN（会抢路由、拦 DNS，导致拨号慢甚至拨不上）
+        "kill_before_dial": True,
         "kill_processes": [
             "flclash.exe", "flclashcore.exe", "flclashhelperservice.exe",
             "eix_client.exe", "mihomo.exe",
@@ -469,6 +471,54 @@ def clear_disabled_adapter(boot_cfg=None):
         os.remove(disabled_adapter_path(boot_cfg))
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------
+# 手动网络选择
+#
+# 用户手动挑"用哪个网络"时记在这里。它的优先级**高于**自动逻辑：
+#   choice = wifi / none  → 不要自动把校园网连回来（用户是故意切走的）
+#   choice = campus       → 明确要校园网
+#   没有这个文件          → 自动模式（断开→翻完墙→自动连回来 就是这种情况）
+# --------------------------------------------------------------------------
+NETWORK_CHOICE_FILE = "network.choice"
+
+
+def network_choice_path(boot_cfg=None):
+    base = HOME_DIR
+    if boot_cfg and boot_cfg.get("user_rules"):
+        base = os.path.dirname(boot_cfg["user_rules"])
+    return os.path.join(base, NETWORK_CHOICE_FILE)
+
+
+def set_network_choice(choice, note=""):
+    """choice: campus / wifi / none。传空字符串等于取消手动选择。"""
+    path = network_choice_path(None)
+    if not choice:
+        return clear_network_choice()
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("%s\t%.0f\t%s" % (choice, time.time(), note or ""))
+        return True
+    except Exception:
+        return False
+
+
+def get_network_choice(boot_cfg=None):
+    try:
+        with open(network_choice_path(boot_cfg), "r", encoding="utf-8-sig") as fh:
+            parts = fh.read().strip().split("\t")
+        return parts[0] if parts and parts[0] else ""
+    except Exception:
+        return ""
+
+
+def clear_network_choice(boot_cfg=None):
+    try:
+        os.remove(network_choice_path(boot_cfg))
+    except OSError:
+        pass
+    return True
 
 
 # --------------------------------------------------------------------------

@@ -303,6 +303,21 @@ class TestRuntimeSignals(unittest.TestCase):
         C.clear_disconnect()
         C.clear_disabled_adapter()
         C.clear_flip_active()
+        C.clear_network_choice()
+
+    def test_network_choice_lifecycle(self):
+        """手动切换网络的选择：切走要记住（自动逻辑让路），切回要清掉。"""
+        self.assertEqual(C.get_network_choice(), "")
+        C.set_network_choice("wifi", "iPhone")
+        self.assertEqual(C.get_network_choice(), "wifi")
+        C.set_network_choice("none")
+        self.assertEqual(C.get_network_choice(), "none")
+        C.clear_network_choice()
+        self.assertEqual(C.get_network_choice(), "")
+
+    def test_kill_before_dial_default_on(self):
+        """拨号前先关代理/VPN 默认开启（会抢路由、拦 DNS，导致拨号慢甚至拨不上）。"""
+        self.assertTrue(DEFAULT_CONFIG["guard"]["kill_before_dial"])
 
     def test_pause_lifecycle(self):
         self.assertFalse(C.pause_active())
