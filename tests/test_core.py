@@ -291,6 +291,34 @@ class TestPortalShared(unittest.TestCase):
         self.assertEqual(pwd, "pw")
 
 
+class TestClientSelection(unittest.TestCase):
+    """翻墙客户端勾选：只勾谁就只用谁（flip.order 里只放勾选的 id）。"""
+
+    def test_no_client_selected_is_handled(self):
+        """一个都没勾时不能崩，也不能偷偷去试名单外的客户端。"""
+        from campusnet.clients import ensure_client_ready
+        cfg = C.load_config()
+        logs = []
+        ok, name, node, key = ensure_client_ready(cfg, [], logs.append)
+        self.assertFalse(ok)
+        self.assertEqual((name, node, key), ("", "", ""))
+        self.assertTrue(any("没有勾选" in m for m in logs), logs)
+
+    def test_unknown_ids_are_dropped(self):
+        from campusnet.clients import ensure_client_ready
+        cfg = C.load_config()
+        logs = []
+        ok, _n, _node, _k = ensure_client_ready(cfg, ["no-such-client"], logs.append)
+        self.assertFalse(ok)
+        self.assertTrue(any("没有勾选" in m for m in logs), logs)
+
+    def test_order_is_what_gets_written(self):
+        cfg = C.load_config()
+        cfg["flip"]["order"] = ["eix"]
+        self.assertEqual(cfg["flip"]["order"], ["eix"])
+        self.assertIn("eix", [c["id"] for c in cfg["clients"]])
+
+
 class TestBootConfig(unittest.TestCase):
     """系统级配置构建：密码必须是机器范围加密、且不含用户范围密文。"""
 
