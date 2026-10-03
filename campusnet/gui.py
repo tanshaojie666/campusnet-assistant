@@ -247,8 +247,14 @@ class App:
         ttk.Radiobutton(when_row, text="任何时候（连着校园网也翻墙）", value="always",
                         variable=self.flip_when_var).pack(side="left")
         ttk.Label(f, justify="left", foreground="#5f6368", font=("Microsoft YaHei UI", 9),
-                  text="选「任何时候」时：校园网认证完成后才开代理，开代理期间系统级守护不会来关它。"
-                  ).pack(anchor="w", pady=(2, 0))
+                  text="选「只在没连校园网时」= 连着校园网时绝不翻墙（推荐）；"
+                       "连着手机热点 / 别的有线无线网时才翻墙。").pack(anchor="w", pady=(2, 0))
+
+        self.browser_always_var = tk.BooleanVar(
+            value=bool(self.cfg["flip"].get("browser_always")))
+        ttk.Checkbutton(f, text="浏览器一打开就翻墙（不靠窗口标题判断，最可靠 —— "
+                                "标题是中文/报错页/新标签页时也能触发）",
+                        variable=self.browser_always_var).pack(anchor="w", pady=(4, 0))
 
         cl = ttk.LabelFrame(f, text=" 翻墙客户端（勾选允许使用的；列表顺序 = 尝试顺序） ", padding=12)
         cl.pack(fill="both", expand=True, pady=(10, 0))
@@ -982,6 +988,7 @@ class App:
         cfg["guard"]["wifi_policy"] = self.wifi_policy_var.get()
         cfg["flip"]["enabled"] = bool(self.flip_var.get())
         cfg["flip"]["when"] = self.flip_when_var.get() or "off_campus"
+        cfg["flip"]["browser_always"] = bool(self.browser_always_var.get())
         cfg["flip"]["order"] = self.checked_client_ids() or []      # 只有勾选的客户端会被使用
         cfg["flip"]["apps"] = self._list_items(self.app_list)
         cfg["flip"]["region_hints"] = [x.strip() for x in self.region_var.get().replace("、", ",").split(",") if x.strip()]
