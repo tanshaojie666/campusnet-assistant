@@ -782,5 +782,31 @@ class TestHotspotAutoConnect(unittest.TestCase):
             root.destroy()
 
 
+    # ------------------------------------------------------------ 回归：模块导入
+    def test_all_modules_import(self):
+        """每个模块都必须能独立导入（缺导入 / 循环导入 / 名字不存在都会在这里炸）。
+
+        CI 里本来想单列一步"导入全部模块"，但那个文件要 token 有 workflow 权限
+        才推得上去；做成测试就没这个限制 —— CI 本来就会跑测试。
+        """
+        import importlib
+        mods = ["campusnet", "campusnet.config", "campusnet.net",
+                "campusnet.clients", "campusnet.rules", "campusnet.guard",
+                "campusnet.installer", "campusnet.util"]
+        for name in mods:
+            try:
+                importlib.import_module(name)
+            except Exception as exc:  # noqa: BLE001
+                self.fail("导入 %s 失败：%r" % (name, exc))
+        try:
+            import tkinter  # noqa: F401
+        except Exception:
+            return                      # 没 tkinter 的环境就跳过 gui
+        try:
+            importlib.import_module("campusnet.gui")
+        except Exception as exc:  # noqa: BLE001
+            self.fail("导入 campusnet.gui 失败：%r" % (exc,))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
