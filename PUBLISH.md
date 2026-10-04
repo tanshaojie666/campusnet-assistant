@@ -111,6 +111,63 @@ git push
 | 中文文件名显示成乱码 | 执行 `git config --global core.quotepath false` |
 | 提示 `LF will be replaced by CRLF` | 正常警告，忽略即可 |
 
+#### 报错：`schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`
+
+在受限环境（或某些安全软件环境下）schannel 后端拿不到凭据句柄，`git` 连不上
+GitHub。改用 openssl 后端即可 —— 但要注意 **`GIT_SSL_BACKEND` 这个环境变量 git 不认**，
+后端只能通过配置项设置。
+
+```powershell
+# 1) 换 openssl 后端
+git config http.sslBackend openssl
+
+# 2) 如果接着报 unable to get local issuer certificate：
+#    说明 HTTPS 被安全软件/加速器拦截了（Kaspersky、迅游、雷神、深信服等都会装自己的根证书）。
+#    把 Windows 证书库并进 git 的信任包（不是关校验）：
+$dir = "$env:USERPROFILE\.git-certs"; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$out = "$dir\ca-bundle-win.crt"
+$sb  = New-Object System.Text.StringBuilder
+[void]$sb.AppendLine((Get-Content 'C:\Program Files\Git\ucrt64\etc\ssl\certs\ca-bundle.crt' -Raw))
+foreach ($store in 'Cert:\LocalMachine\Root','Cert:\CurrentUser\Root','Cert:\LocalMachine\CA') {
+  foreach ($c in Get-ChildItem $store -ErrorAction SilentlyContinue) {
+    $b64 = [Convert]::ToBase64String($c.RawData)
+    [void]$sb.AppendLine('-----BEGIN CERTIFICATE-----')
+    for ($i = 0; $i -lt $b64.Length; $i += 64) { [void]$sb.AppendLine($b64.Substring($i, [Math]::Min(64, $b64.Length - $i))) }
+    [void]$sb.AppendLine('-----END CERTIFICATE-----')
+  }
+}
+Set-Content -Path $out -Value $sb.ToString() -Encoding ascii
+
+# 3) 让 git 用这个合并包（路径按你机器上的 Git 安装位置调整）
+git config http.sslCAInfo "$out"
+
+# 4) 验证（能列出 refs 就通了）
+git ls-remote --heads https://github.com/tanshaojie666/campusnet-assistant.git
+```
+
+> 跟踪仓库的 `ca-bundle.crt` 位置可以用 `git --exec-path` 推出来，
+> 它形如 `C:/Program Files/Git/ucrt64/libexec/git-core`，
+> 证书包在安装目录的 `etc\ssl\certs\ca-bundle.crt`。
+
+#### 报错：`refusing to allow a Personal Access Token to create or update workflow ... without workflow scope`
+
+这是 GitHub 的保护规则：**token 没有 `workflow` 权限时，任何改动
+`.github/workflows/` 下文件的提交都会被拒绝**（API 也一样，而且容易"静默"失败 ——
+其余文件推上去了，只有这个文件没上去）。
+
+三种处理方式，任选一个：
+
+1. 给 PAT 加上 `workflow` 权限（经典 token 在 Settings → Developer settings →
+   Personal access tokens → 编辑该 token → 勾 `workflow`），然后重新 `git push`；
+2. 在 GitHub 网页上直接编辑该 workflow 文件（网页编辑不受 token 权限限制）；
+3. **把要加的检查写成单元测试** —— 测试文件在 `.github/workflows/` 之外，
+   而 CI 本来就会跑 `python -m unittest discover -s tests`，效果一样。
+   （本项目就是这么做的：`scripts/check_names.py` 的作用域自查由
+   `tests/test_core.py::test_check_names_is_scope_aware` 带着跑。）
+
+> 排查提示：`git status` 若显示某个 workflow 文件一直"已修改但推不上去"，
+> 基本就是这条规则，而不是网络问题。
+
 #### 通过本地代理访问 GitHub（网络不通时）
 
 如果你平时靠本地代理上网（例如 Clash/mihomo 监听 `127.0.0.1:7893`），给 Git 单独配上代理：
