@@ -112,3 +112,7 @@ credential*.xml
 /screenshots/
 /local/
 *.local.json
+
+# 调试/检查脚本的临时残留目录（工作副本就地运行时产生）
+_dbg-*/
+_tmp*/
