@@ -808,5 +808,121 @@ class TestHotspotAutoConnect(unittest.TestCase):
             self.fail("导入 campusnet.gui 失败：%r" % (exc,))
 
 
+class TestTraySelfHeal(unittest.TestCase):
+    """托盘图标丢了要能自己回来。
+
+    用户实测症状：**托盘里没图标了，但进程还在跑**。
+    根因：图标是手工 Shell_NotifyIconW 注册的，而资源管理器每次重启都会
+    把所有托盘图标丢掉，只广播一条 TaskbarCreated 让程序自己重加 ——
+    以前根本没处理这条消息，图标就永久消失；窗口又是隐藏的，
+    用户连"重新打开一次"都不能（第二次启动只会弹"请看右下角托盘"）。
+    """
+
+    def _fake_tray(self, add_ok=True, modify_ok=True):
+        """造个 TrayIcon，但把真实 Win32 调用全换成假的。"""
+        from campusnet.util import TrayIcon, NIM_ADD, NIM_MODIFY
+        tray = TrayIcon("测试")
+        state = {"add": 0, "shell": []}
+
+        def fake_add():
+            state["add"] += 1
+            tray.added = bool(add_ok)
+            return bool(add_ok)
+
+        def fake_shell(op, data=None):
+            state["shell"].append(op)
+            return bool(modify_ok) if op == NIM_MODIFY else True
+
+        tray.add = fake_add
+        tray._shell = fake_shell
+        return tray, state
+
+    def test_verify_keeps_icon_when_shell_still_has_it(self):
+        tray, state = self._fake_tray(modify_ok=True)
+        tray.added = True
+        self.assertEqual(tray.verify(), "ok")
+        self.assertEqual(state["add"], 0)              # 不该没事乱重加
+
+    def test_one_transient_failure_does_not_touch_the_icon(self):
+        """偶尔一次 NIM_MODIFY 失败（资源管理器正忙）不该把图标摘了又挂 —— 会闪。"""
+        tray, state = self._fake_tray(modify_ok=False)
+        tray.added = True
+        self.assertEqual(tray.verify(), "ok")          # 第一次：先观察
+        self.assertEqual(state["add"], 0)              # 没动图标
+        self.assertEqual(tray.verify(), "readded")     # 连着两次才动手
+        self.assertEqual(state["add"], 1)
+
+    def test_verify_readds_when_shell_lost_the_icon(self):
+        tray, state = self._fake_tray(modify_ok=False)  # 系统那边已经没这个图标
+        tray.added = True
+        tray.verify()                                  # 第一次失败只是记账
+        self.assertEqual(tray.verify(), "readded")
+        self.assertEqual(state["add"], 1)              # 已经重新登记回去
+        self.assertTrue(tray.added)
+
+    def test_verify_readds_when_startup_add_failed(self):
+        """开机比资源管理器还早时启动就加不上，之后必须能补上。"""
+        tray, state = self._fake_tray(modify_ok=True)
+        tray.added = False
+        self.assertEqual(tray.verify(), "readded")
+        self.assertEqual(state["add"], 1)
+
+    def test_taskbar_created_broadcast_triggers_readd(self):
+        """资源管理器重启的广播必须让图标自己回来（这是本次的根因）。"""
+        from campusnet import util
+        tray, state = self._fake_tray()
+        tray.added = True
+        old = util._TASKBAR_CREATED
+        try:
+            util._TASKBAR_CREATED = 0xC123             # 假装系统给的注册消息号
+            tray._wnd_proc(0, 0xC123, 0, 0)
+        finally:
+            util._TASKBAR_CREATED = old
+        self.assertEqual(state["add"], 1)
+        self.assertEqual(tray.poll(), ["tray_restored"])
+
+    def test_wake_existing_finds_and_pokes_the_window(self):
+        """第二次点快捷方式：要把已经在跑的那个窗口叫出来，而不是干瞪眼。"""
+        from campusnet.util import TrayIcon
+        poked = []
+        old_find, old_post = TrayIcon._find_tray_window, TrayIcon._post_show
+        try:
+            TrayIcon._find_tray_window = staticmethod(lambda: 0)
+            self.assertFalse(TrayIcon.wake_existing())   # 没找到 → False
+            TrayIcon._find_tray_window = staticmethod(lambda: 12345)
+            TrayIcon._post_show = staticmethod(lambda h: poked.append(h) or True)
+            self.assertTrue(TrayIcon.wake_existing())
+            self.assertEqual(poked, [12345])             # 真的戳了那个窗口
+        finally:
+            TrayIcon._find_tray_window = old_find
+            TrayIcon._post_show = old_post
+
+    def test_findwindow_uses_the_same_class_name(self):
+        """FindWindowW 找的类名必须和建窗口时用的一致，否则永远叫不醒。"""
+        from campusnet.util import TrayIcon, TRAY_WINDOW_CLASS
+        self.assertEqual(TrayIcon("x")._class, TRAY_WINDOW_CLASS)
+
+    def test_gui_pump_actually_calls_verify(self):
+        """体检必须真的被界面循环调用 —— "代码写了但没人调"正是上次的病。"""
+        import inspect
+        try:
+            from campusnet.gui import App
+        except Exception:
+            self.skipTest("没有 tkinter")
+        src = inspect.getsource(App._pump)
+        self.assertIn("tray.verify()", src)
+        self.assertIn("tray_restored", src)
+
+    def test_run_gui_wakes_existing_instance(self):
+        """单实例分支必须先试着叫醒旧实例，再考虑弹框。"""
+        import inspect
+        try:
+            from campusnet import gui
+        except Exception:
+            self.skipTest("没有 tkinter")
+        src = inspect.getsource(gui.run_gui)
+        self.assertIn("wake_existing()", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

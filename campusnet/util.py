@@ -355,7 +355,7 @@ def clear_all_user_proxies():
 # 右下角托盘图标（纯 ctypes）
 # --------------------------------------------------------------------------
 WM_TRAY = 0x8000 + 1
-NIM_ADD, NIM_DELETE, NIM_SETVERSION = 0, 2, 4
+NIM_ADD, NIM_MODIFY, NIM_DELETE, NIM_SETVERSION = 0, 1, 2, 4
 NOTIFYICON_VERSION_4 = 4
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
 WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_RBUTTONUP = 0x0202, 0x0203, 0x0205
@@ -363,9 +363,30 @@ WM_CONTEXTMENU = 0x007B      # 有些系统（NOTIFYICON_VERSION_4）右键发�
 TPM_RETURNCMD, TPM_RIGHTBUTTON = 0x0100, 0x0002
 MF_STRING, MF_SEPARATOR = 0x0, 0x800
 IDM_SHOW, IDM_CHECK, IDM_QUIT = 1001, 1002, 1003
+# 托盘窗口的类名：第二个实例靠 FindWindowW 找它，把已在跑的那个窗口叫出来。
+TRAY_WINDOW_CLASS = "CampusNetAssistantTrayWnd"
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT,
                              wintypes.WPARAM, wintypes.LPARAM)
+
+# 资源管理器（explorer.exe）每次重启都会给所有顶层窗口广播这条消息，
+# **并且把之前注册过的托盘图标全部丢掉**。收到它的程序必须重新 NIM_ADD，
+# 否则图标就永久消失、进程却还在跑 —— 用户看到的就是"托盘里没图标了"。
+_TASKBAR_CREATED = None
+
+
+def taskbar_created_message():
+    """取 "TaskbarCreated" 的注册消息号（拿不到就返回 0，调用方当没有处理）。"""
+    global _TASKBAR_CREATED
+    if _TASKBAR_CREATED is None:
+        try:
+            u = ctypes.windll.user32
+            u.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
+            u.RegisterWindowMessageW.restype = wintypes.UINT
+            _TASKBAR_CREATED = int(u.RegisterWindowMessageW("TaskbarCreated")) or 0
+        except Exception:
+            _TASKBAR_CREATED = 0
+    return _TASKBAR_CREATED
 
 
 class WNDCLASSW(ctypes.Structure):
@@ -416,8 +437,9 @@ class TrayIcon:
         self.hwnd = None
         self.hicon = None
         self.added = False
+        self._verify_fails = 0
         self._proc_ref = None
-        self._class = "CampusNetAssistantTrayWnd"
+        self._class = TRAY_WINDOW_CLASS
         self._uid = 1
         self._pending = []            # 待界面线程执行的动作
         self._lock_pending = threading.Lock()
@@ -442,7 +464,15 @@ class TrayIcon:
 
     def _wnd_proc(self, hwnd, msg, wparam, lparam):
         try:
-            if msg == WM_TRAY:
+            tc = taskbar_created_message()
+            if tc and msg == tc:
+                # 资源管理器重启了 —— 它会把之前登记的托盘图标全部丢掉，
+                # 收到这条广播的程序必须自己重新登记，否则图标永久消失、
+                # 进程却还在后台跑（用户只能去任务管理器里杀）。
+                self.added = False
+                if self.add():
+                    self._post("tray_restored")
+            elif msg == WM_TRAY:
                 # 托盘回调里 lparam 的低位才是"发生了什么事"，
                 # 有的系统会把坐标/图标 ID 塞在高位，所以先取低位。
                 ev = int(lparam) & 0xFFFF
@@ -514,6 +544,10 @@ class TrayIcon:
         nid.uID = self._uid
         nid.uCallbackMessage = WM_TRAY
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        if not self.hicon:
+            # 一个图标句柄都拿不到时去掉 NIF_ICON：系统会给个默认图标，
+            # 总比整个 NIM_ADD 失败、右下角什么都没有强。
+            nid.uFlags &= ~NIF_ICON
         nid.hIcon = self.hicon
         nid.szTip = self.tooltip[:127]
         return nid
@@ -544,37 +578,104 @@ class TrayIcon:
             if not self.hwnd:
                 return False
             shell32 = ctypes.windll.shell32
-            # 同样要声明 argtypes：ExtractIconW 不声明时传字符串会抛异常，
+            # 声明 argtypes：ExtractIconW 不声明时传字符串会抛异常，
             # 就只能退回系统默认图标（以前的图标是"通用空白图标"就是这个原因）。
             shell32.ExtractIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
                                              wintypes.UINT]
             shell32.ExtractIconW.restype = wintypes.HICON
-            shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
-                                                  ctypes.POINTER(NOTIFYICONDATAW)]
-            shell32.Shell_NotifyIconW.restype = wintypes.BOOL
             try:
                 self.hicon = shell32.ExtractIconW(None, sys.executable, 0)
             except Exception:
                 self.hicon = None
             if not self.hicon:
+                # MAKEINTRESOURCE(32512)=IDI_APPLICATION。注意必须是**整数**当指针
+                # 传（c_void_p），以前写成 c_wchar_p(32512) 是"把整数当字符串"，
+                # 拿到的是个野句柄，图标会变成空白。
+                u.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
                 u.LoadIconW.restype = wintypes.HICON
-                u.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
                 try:
-                    self.hicon = u.LoadIconW(None, ctypes.c_wchar_p(32512))
+                    self.hicon = u.LoadIconW(None, 32512)
                 except Exception:
                     self.hicon = None
-            self.added = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._data())))
+            self.added = self._shell(NIM_ADD)
             return self.added
         except Exception:
             return False
 
+    def _shell(self, op, data=None):
+        """全类只在这里调 Shell_NotifyIconW（方便测试替换成假的）。"""
+        try:
+            shell32 = ctypes.windll.shell32
+            shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD,
+                                                  ctypes.POINTER(NOTIFYICONDATAW)]
+            shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+            return bool(shell32.Shell_NotifyIconW(op,
+                                                  ctypes.byref(data or self._data())))
+        except Exception:
+            return False
+
+    def verify(self):
+        """确认图标还在：返回 "ok" / "readded" / "failed"。
+
+        界面线程每 20 秒调一次。用 NIM_MODIFY 试探 —— 系统那边**没有**这个图标时
+        它返回 False（这正是"图标被弄丢了"的可靠信号），于是立刻重新登记。
+        启动时没加上（例如开机比资源管理器还早）也会被这里补上。
+        """
+        if not self.added:
+            self.added = self.add()
+            return "readded" if self.added else "failed"
+        if self._shell(NIM_MODIFY):
+            self._verify_fails = 0
+            return "ok"
+        # 偶尔失败可能只是资源管理器正好忙；连着两次才算"真丢了"，
+        # 免得图标没事被我们摘下来又挂上去（会闪）。
+        self._verify_fails += 1
+        if self._verify_fails < 2:
+            return "ok"
+        self._verify_fails = 0
+        self.added = False
+        self.added = self.add()
+        return "readded" if self.added else "failed"
+
+    @staticmethod
+    def _find_tray_window():
+        """找到正在运行的那个实例的托盘窗口（没有就返回 0）。"""
+        try:
+            u = ctypes.windll.user32
+            u.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+            u.FindWindowW.restype = wintypes.HWND
+            return u.FindWindowW(TRAY_WINDOW_CLASS, None)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _post_show(hwnd):
+        """给那个窗口发一次"单击左键"（它自己的窗口过程会登记"显示主界面"）。"""
+        try:
+            u = ctypes.windll.user32
+            u.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                       wintypes.LPARAM]
+            u.PostMessageW.restype = wintypes.BOOL
+            return bool(u.PostMessageW(hwnd, WM_TRAY, 0, WM_LBUTTONUP))
+        except Exception:
+            return False
+
+    @classmethod
+    def wake_existing(cls):
+        """把**已经在跑的那个实例**的窗口叫出来，返回是否叫到。
+
+        用在"用户又点了一次快捷方式"的时候。以前这里只弹一句
+        "请看右下角托盘" —— 可图标要是被用户手动藏了、或被资源管理器弄丢了，
+        这句话等于让人去任务管理器杀进程。现在直接找到那个托盘窗口，
+        给它发一次"单击左键"，它就会把主界面显示出来。
+        """
+        hwnd = cls._find_tray_window()
+        return bool(hwnd) and cls._post_show(hwnd)
+
     def remove(self):
         if not self.added:
             return
-        try:
-            ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._data()))
-        except Exception:
-            pass
+        self._shell(NIM_DELETE)
         self.added = False
 
 

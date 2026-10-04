@@ -32,7 +32,7 @@ import tkinter as tk                                              # noqa: E402
 from campusnet import config as C                                 # noqa: E402
 from campusnet.gui import App                                     # noqa: E402
 from campusnet.util import (WM_TRAY, WM_LBUTTONUP, WM_LBUTTONDBLCLK,  # noqa: E402
-                            WM_RBUTTONUP)
+                            WM_RBUTTONUP, taskbar_created_message)
 
 
 def main():
@@ -85,6 +85,30 @@ def main():
         app.tray._menu = real_menu
     res["right"] = bool(root.winfo_viewable())
 
+    # 5) 假装资源管理器重启：它会把托盘图标全丢掉，只广播一条 TaskbarCreated。
+    #    收到就必须自己重新登记，否则图标永久消失、窗口又收着 = 再也点不到。
+    #    这里数 add() 被调了几次（受限环境里 NIM_ADD 本来就失败，也能验证）。
+    calls = {"n": 0}
+    real_add = app.tray.add
+
+    def counting_add():
+        calls["n"] += 1
+        return real_add()
+
+    app.tray.add = counting_add
+    u.PostMessageW(app.tray.hwnd, taskbar_created_message(), 0, 0)
+    pump(0.8)
+    res["readd_after_explorer"] = calls["n"] > 0
+
+    # 6) 体检自愈：系统连着两次说"没这个图标"时，必须尝试重新登记。
+    before = calls["n"]
+    app.tray.added = True                               # 假装当前图标是登记着的
+    app.tray._shell = lambda op, data=None: False       # 假装系统那边没图标了
+    app.tray.verify()
+    res["no_flicker"] = calls["n"] == before            # 第一次失败不该动图标
+    app.tray.verify()
+    res["self_heal"] = calls["n"] > before
+
     app.closing = True
     try:
         app.tray.remove()
@@ -105,7 +129,11 @@ if __name__ == "__main__":
     print("  【单击左键】后主界面可见=%s" % r.get("single"))
     print("  【双击左键】后主界面可见=%s" % r.get("double"))
     print("  【右键菜单选显示】后主界面可见=%s" % r.get("right"))
+    print("  【模拟资源管理器重启】图标自动重新登记=%s" % r.get("readd_after_explorer"))
+    print("  【图标真丢了】连丢两次才动手（不闪）=%s / 已自动放回=%s"
+          % (r.get("no_flicker"), r.get("self_heal")))
     print("  进程正常退出（没有崩溃）✓")
-    ok = r.get("tray_ok") and r.get("single") and r.get("double") and r.get("right")
+    ok = (r.get("tray_ok") and r.get("single") and r.get("double") and r.get("right")
+          and r.get("readd_after_explorer") and r.get("no_flicker") and r.get("self_heal"))
     print("\n结论：%s" % ("托盘工作正常 ✓" if ok else "托盘仍有问题 ✗"))
     sys.exit(0 if ok else 1)

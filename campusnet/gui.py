@@ -82,6 +82,7 @@ class App:
                              lambda fn: self.root.after(0, fn),
                              self.show_window, self.check_now, self.quit_app)
         self.tray_ok = self.tray.add()
+        self._tray_check_ticks = 0
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._sync_snap()
@@ -825,8 +826,21 @@ class App:
                     self.check_now()
                 elif action == "quit":
                     self.quit_app()
+                elif action == "tray_restored":
+                    self.log("托盘图标已自动放回右下角（资源管理器刚重启过）。")
         except Exception:
             pass
+        # 每 20 秒确认一次托盘图标还在。资源管理器重启会把所有托盘图标丢掉，
+        # 而"图标没了 + 窗口已隐藏"= 用户彻底点不到这个程序（只能去任务管理器），
+        # 所以不能只等广播，还要自己定期体检。
+        self._tray_check_ticks += 1
+        if self._tray_check_ticks >= 133:
+            self._tray_check_ticks = 0
+            try:
+                if self.tray.verify() == "readded":
+                    self.log("托盘图标不见了，已自动放回右下角。")
+            except Exception:
+                pass
         self.root.after(150, self._pump)
 
     def _set_status(self, text, level):
@@ -1778,10 +1792,17 @@ def run_gui(minimized=False, cfg=None):
     else:
         handle = True          # 用户关掉了"只允许一个"，就不再抢锁
     if handle is None:
+        # 已经有实例在跑：**先把这个实例的窗口叫出来**。
+        # 托盘图标可能被用户手动藏了、或被资源管理器弄丢了，
+        # 这时只说一句"请看右下角托盘"就等于让人去任务管理器杀进程。
+        if TrayIcon.wake_existing():
+            return 0
         try:
             ctypes.windll.user32.MessageBoxW(
-                None, "校园网助手已经在运行了。\n\n"
-                      "请看屏幕右下角托盘里的图标，双击它就能打开窗口。",
+                None, "校园网助手已经在运行了（窗口收到了托盘里）。\n\n"
+                      "刚才已经通知它显示窗口；如果还是没看到：\n"
+                      "· 按 Alt+Tab 找「校园网助手」；\n"
+                      "· 或者到任务管理器结束 pythonw.exe，再重新打开。",
                 "校园网助手", 0x40)
         except Exception:
             pass
